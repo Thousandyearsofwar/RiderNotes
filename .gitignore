@@ -1,0 +1,11 @@
+.gradle/
+build/
+out/
+.idea/
+.intellijPlatform/
+*.iml
+local.properties
+.DS_Store
+
+# 本地测试数据（笔记库本身按项目提交，这里只排除 IDE 生成的）
+*.log

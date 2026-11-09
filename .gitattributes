@@ -1,0 +1,12 @@
+# 统一换行，避免 Windows/Linux 之间的无意义 diff
+* text=auto
+
+# 脚本必须保持原样（gradlew 在 Unix 上要 LF，PowerShell 在 Windows 上要 CRLF）
+gradlew text eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制
+*.jar binary
+*.png binary
+*.zip binary

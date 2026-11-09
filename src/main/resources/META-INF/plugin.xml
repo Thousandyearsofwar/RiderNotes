@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<idea-plugin>
+    <id>com.thousandyearsofwar.ridenotes</id>
+    <name>Sidecar Notes</name>
+    <vendor>thousandyearsofwar</vendor>
+
+    <description><![CDATA[
+        Sidecar notes for code ranges: attach notes to any piece of code without touching the source file.
+        Notes live in a separate JSON library inside the project and can be committed and shared with the team.
+        <br/>
+        给代码区间挂"侧挂笔记"：不写源文件，靠色带 + gutter 图标 + 摘要块呈现，笔记存放在项目内的独立 JSON 库中。
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <resource-bundle>messages.RiderNotesBundle</resource-bundle>
+
+    <idea-version since-build="262"/>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <editorFactoryListener implementation="com.thousandyearsofwar.ridenotes.editor.EditorAnchorListener"/>
+        <notificationGroup id="RiderNotes" displayType="BALLOON" isLogByDefault="false"/>
+        <postStartupActivity implementation="com.thousandyearsofwar.ridenotes.api.NotesStartup"/>
+        <toolWindow id="Sidecar Notes"
+                    anchor="right"
+                    factoryClass="com.thousandyearsofwar.ridenotes.ui.NotesToolWindowFactory"/>
+    </extensions>
+
+    <actions>
+        <action id="RiderNotes.CreateAnchor"
+                class="com.thousandyearsofwar.ridenotes.actions.CreateAnchorAction"
+                text="%action.create.text"
+                description="%action.create.description">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt N"/>
+            <add-to-group group-id="EditorPopupMenu" anchor="first"/>
+        </action>
+        <action id="RiderNotes.DeleteAnchor"
+                class="com.thousandyearsofwar.ridenotes.actions.DeleteAnchorAction"
+                text="%action.delete.text"
+                description="%action.delete.description">
+            <add-to-group group-id="EditorPopupMenu" anchor="after" relative-to-action="RiderNotes.CreateAnchor"/>
+        </action>
+        <action id="RiderNotes.Refresh"
+                class="com.thousandyearsofwar.ridenotes.actions.RefreshAnchorsAction"
+                text="%action.refresh.text"
+                description="%action.refresh.description">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+        <action id="RiderNotes.ToggleCompact"
+                class="com.thousandyearsofwar.ridenotes.actions.ToggleCompactAction"
+                text="%action.compact.text">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+        <action id="RiderNotes.ToggleLock"
+                class="com.thousandyearsofwar.ridenotes.actions.ToggleLockAction"
+                text="%action.lock.text">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>
