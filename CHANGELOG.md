@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.59.2
+
+### 新增
+- **从 IDE 书签导入**：面板「更多 ▾ → 从 IDE 书签导入…」，把 gutter 上的 F11 书签批量转成锚点。
+  - 直接走 `BookmarksManager` API，不依赖 `workspace.xml` 的落盘时机
+  - 按文件自动建组：顶层「书签导入 MM-dd HH:mm」，某文件书签 ≥ 2 时建子组
+  - 书签描述 → 锚点标题 + 笔记正文（`attributes["description"]` → `prepareDefaultDescription()` → 行文本 依次兜底）
+  - 可选「导入并删除原书签」
+  - 批量写盘：每个文件一次，几千条也是秒级
+
+## 0.58.1
+
+### 修复
+- 面板拖拽时不再触发 JTable 自带的拖动扩选（经过的行会被“激活”）
+
 ## 0.58.0
 
 ### 重构（数据模型 schema 2）

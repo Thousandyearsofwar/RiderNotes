@@ -499,6 +499,7 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
             menu.add(com.thousandyearsofwar.ridenotes.RiderNotesBundle.message("panel.refresh")).addActionListener { refresh() }
             menu.add(com.thousandyearsofwar.ridenotes.RiderNotesBundle.message("panel.cleanup")).addActionListener { pruneOrphanPlacements() }
             menu.addSeparator()
+            menu.add("从 IDE 书签导入…").addActionListener { importBookmarks() }
             menu.add("导出 Markdown 到剪贴板").addActionListener { exportMarkdown() }
             menu.add("导出 PR 评论到剪贴板").addActionListener { exportPullRequest() }
             menu.show(moreButton, 0, moreButton.height)
@@ -644,6 +645,41 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
             0
         }
         com.thousandyearsofwar.ridenotes.util.NoteLog.notify(project, "已清理 $removed 条无效归属")
+        refresh()
+    }
+
+    /** 把 IDE 的 F11 书签批量转换成锚点。 */
+    private fun importBookmarks() {
+        val choice = Messages.showYesNoCancelDialog(
+            project,
+            "把当前项目里的 IDE 书签（gutter 上的 F11 书签）转换成 Sidecar Notes 锚点。\n\n" +
+                "· 每个书签会变成一条锚点，标题取该行代码内容\n" +
+                "· 转换后可以选择是否删除原来的书签\n\n" +
+                "要同时删除原书签吗？",
+            "从 IDE 书签导入",
+            "导入并删除原书签",
+            "仅导入",
+            "取消",
+            null
+        )
+        if (choice == Messages.CANCEL) return
+        val deleteAfter = choice == Messages.YES
+
+        val result = runCatching { BookmarkImporter.import(project, deleteAfter) }.getOrElse {
+            com.thousandyearsofwar.ridenotes.util.NoteLog.warn("bookmark import failed: ${it.message}")
+            return
+        }
+        val suffix = if (deleteAfter) "，并删除原书签" else ""
+        if (result.created == 0) {
+            com.thousandyearsofwar.ridenotes.util.NoteLog.notify(
+                project, "没有可导入的书签（跳过 ${result.skipped} 个）"
+            )
+        } else {
+            com.thousandyearsofwar.ridenotes.util.NoteLog.notify(
+                project, "已导入 ${result.created} 个书签$suffix（跳过 ${result.skipped} 个）"
+            )
+        }
+        AnchorRenderService.get(project).refreshAll()
         refresh()
     }
 
