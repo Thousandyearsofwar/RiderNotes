@@ -42,6 +42,8 @@ class Anchor(
     var compact: Boolean = false,
     /** 单条颜色覆盖；null 表示跟随分组。 */
     var colorOverride: Int? = null,
+    /** 克隆锚点：指向源锚点 id，笔记内容与源保持一致（只读镜像）。 */
+    var mirrorOf: String? = null,
     var createdAt: String = now(),
     var updatedAt: String = now(),
     var notes: MutableList<Note> = mutableListOf()

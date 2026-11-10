@@ -59,10 +59,23 @@ class NoteAnchorService(private val project: Project) {
         return stored.sortedBy { it.startOffset }.toMutableList()
     }
 
+    /** 默认分组：新建锚点自动落进去；分组被删后自动失效。 */
+    fun defaultGroupId(): String? {
+        val index = index()
+        val id = index.defaultGroupId ?: return null
+        return id.takeIf { index.group(it) != null }
+    }
+
+    fun setDefaultGroup(id: String?) {
+        index().defaultGroupId = id
+        saveIndex()
+    }
+
     fun addAnchor(file: VirtualFile, anchor: Anchor) {
         val relativePath = relativePath(file) ?: return
         val list = mutableAnchors(relativePath)
         anchor.color = nextColor(list)
+        if (anchor.groupId == null) anchor.groupId = defaultGroupId()
         list.add(anchor)
         list.sortBy { it.startOffset }
         persist(relativePath)
@@ -75,8 +88,10 @@ class NoteAnchorService(private val project: Project) {
     fun addAnchors(file: VirtualFile, anchors: List<com.thousandyearsofwar.ridenotes.model.Anchor>) {
         val relativePath = relativePath(file) ?: return
         val list = mutableAnchors(relativePath)
+        val fallbackGroup = defaultGroupId()
         anchors.forEach { anchor ->
             anchor.color = nextColor(list)
+            if (anchor.groupId == null) anchor.groupId = fallbackGroup
             list.add(anchor)
         }
         list.sortBy { it.startOffset }
@@ -362,8 +377,38 @@ class NoteAnchorService(private val project: Project) {
             migrationDone = true
             runCatching { migratePlacements(loaded) }
                 .onFailure { com.thousandyearsofwar.ridenotes.util.NoteLog.warn("migration failed: ${it.message}") }
+            runCatching { migrateOrder(loaded) }
+                .onFailure { com.thousandyearsofwar.ridenotes.util.NoteLog.warn("order migration failed: ${it.message}") }
         }
         return loaded
+    }
+
+    /**
+     * schema 2 → 3：组和锚点改用同一个顺序键 `orderValue`，从此可以任意穿插。
+     *
+     * 现有数据里组用 `order`（0,1,2…）、锚点用 1,2,3…，直接把锚点整体 +1000，
+     * 保证迁移后"组在前、锚点在后"的观感不变，之后拖拽再按中点插入。
+     */
+    private fun migrateOrder(index: com.thousandyearsofwar.ridenotes.model.ProjectIndex) {
+        if (index.schema >= 3) return
+        index.groups.forEach { it.orderValue = it.order.toDouble() }
+
+        AnchorStore.listAll(project).forEach { shard ->
+            var dirty = false
+            shard.anchors.forEach { anchor ->
+                anchor.orderValue += 1000.0
+                dirty = true
+            }
+            if (dirty) {
+                val list = shard.anchors.sortedBy { it.startOffset }.toMutableList()
+                cache[shard.file] = list
+                AnchorStore.save(project, shard.file, list)
+            }
+        }
+
+        index.schema = 3
+        saveIndex()
+        com.thousandyearsofwar.ridenotes.util.NoteLog.info("migrated order keys to schema 3")
     }
 
     /**
@@ -467,6 +512,8 @@ class NoteAnchorService(private val project: Project) {
         // 子组上移一层
         index.groups.filter { it.parentId == id }.forEach { it.parentId = group.parentId }
         index.groups.remove(group)
+        // 默认分组被删：回退到它的父级，避免新锚点落进不存在的组
+        if (index.defaultGroupId == id) index.defaultGroupId = group.parentId
         saveIndex()
 
         // 子锚点移到父级（归属现在存在锚点里，需要写回各自分片）
@@ -513,6 +560,164 @@ class NoteAnchorService(private val project: Project) {
     /** 供面板/接口做全库视图（归属已经存在锚点里）。 */
     fun anchorsSnapshot(): List<Anchor> = allAnchors()
 
+    /** 锚点 + 它所在的分片路径，用于导出、恢复等需要文件路径的场景。 */
+    fun anchorsWithFiles(): List<Pair<String, Anchor>> =
+        AnchorStore.listAll(project).flatMap { shard ->
+            val list = cache[shard.file]
+                ?: shard.anchors.sortedBy { it.startOffset }.toMutableList().also { cache[shard.file] = it }
+            list.map { shard.file to it }
+        }
+
+    /**
+     * 在面板里给锚点创建一个**克隆节点**：只是列表里的别名，
+     * 不占用新的代码区间，也不在编辑器里渲染任何内容。
+     */
+    fun createCloneNode(sourceId: String): Anchor? {
+        val (path, found) = findAnchor(sourceId) ?: return null
+        val source = mirrorSource(found) ?: found
+        val basePath = project.basePath ?: return null
+        val file = com.intellij.openapi.vfs.LocalFileSystem.getInstance()
+            .findFileByPath(if (path.startsWith("/") || path.contains(":")) path else "$basePath/$path")
+            ?: return null
+
+        val clone = Anchor(
+            startOffset = source.startOffset,
+            endOffset = source.endOffset,
+            startLine = source.startLine,
+            endLine = source.endLine,
+            anchorText = source.anchorText,
+            anchorSha1 = source.anchorSha1,
+            contextBefore = source.contextBefore,
+            contextAfter = source.contextAfter
+        )
+        clone.mirrorOf = source.id
+        clone.groupId = source.groupId
+        // 紧跟在源锚点后面
+        clone.orderValue = source.orderValue + 0.5
+        clone.createdBy = resolveAuthor(project)
+        addAnchor(file, clone)
+        com.thousandyearsofwar.ridenotes.util.NoteLog.info("create clone node ${clone.id} of ${source.id}")
+        return clone
+    }
+
+    /** 批量把锚点移进同一个分组（多选"移动到分组"用），每个分片只写一次。 */
+    fun moveAnchorsToGroup(items: List<Pair<String, String>>, groupId: String?): Int {
+        if (items.isEmpty()) return 0
+        var nextOrder = (allAnchors().filter { it.groupId == groupId }.maxOfOrNull { it.orderValue } ?: 0.0) + 1.0
+        var moved = 0
+        inBulk {
+            items.groupBy({ it.first }, { it.second }).forEach { (path, ids) ->
+                val list = mutableAnchors(path)
+                var changed = false
+                ids.forEach { id ->
+                    val anchor = list.firstOrNull { it.id == id } ?: return@forEach
+                    anchor.groupId = groupId
+                    anchor.orderValue = nextOrder++
+                    anchor.updatedAt = java.time.Instant.now().toString()
+                    changed = true
+                    moved++
+                }
+                if (changed) persist(path)
+            }
+        }
+        return moved
+    }
+
+    /** 克隆锚点的源锚点；不是克隆、或源已被删除时返回 null。 */
+    fun mirrorSource(anchor: Anchor): Anchor? =
+        anchor.mirrorOf?.let { sourceId -> findAnchor(sourceId)?.second }
+
+    /** 渲染/面板展示用的笔记：克隆锚点用源的笔记。 */
+    fun resolvedNotes(anchor: Anchor): List<com.thousandyearsofwar.ridenotes.model.Note> =
+        mirrorSource(anchor)?.notes ?: anchor.notes
+
+    /**
+     * 展示用标题：克隆锚点用**源锚点的显示名**（标题为空时用源的正文首行/行号），
+     * 保证克隆行和源行看起来一致。
+     */
+    fun resolvedTitle(anchor: Anchor): String {
+        val source = mirrorSource(anchor) ?: return anchor.title
+        return source.title.ifBlank { source.displayTitle }
+    }
+
+    /**
+     * 在指定区间创建一个**克隆锚点**：位置是自己的，笔记内容跟随源锚点。
+     * 源锚点改了标题/笔记，克隆处渲染出来的内容随之变化。
+     */
+    fun createMirror(
+        sourceId: String,
+        file: VirtualFile,
+        document: com.intellij.openapi.editor.Document,
+        range: com.intellij.openapi.util.TextRange
+    ): Anchor? {
+        val source = findAnchor(sourceId)?.second ?: return null
+        val mirror = com.thousandyearsofwar.ridenotes.model.Anchoring.createAnchor(document, range)
+        mirror.mirrorOf = source.id
+        mirror.groupId = source.groupId
+        mirror.orderValue = source.orderValue
+        mirror.createdBy = source.createdBy.ifBlank { currentAuthor() }
+        addAnchor(file, mirror)
+        com.thousandyearsofwar.ridenotes.util.NoteLog.info(
+            "create mirror id=${mirror.id} of=${source.id} lines=${mirror.startLine}-${mirror.endLine}"
+        )
+        return mirror
+    }
+
+    /** 批量修改锚点：按分片归组，每片只写一次。返回处理条数。 */
+    fun updateAnchors(items: List<Pair<String, String>>, mutate: (Anchor) -> Unit): Int {
+        var count = 0
+        inBulk {
+            items.groupBy({ it.first }, { it.second }).forEach { (path, ids) ->
+                val list = mutableAnchors(path)
+                var changed = false
+                ids.forEach { id ->
+                    val anchor = list.firstOrNull { it.id == id } ?: return@forEach
+                    mutate(anchor)
+                    anchor.updatedAt = java.time.Instant.now().toString()
+                    changed = true
+                    count++
+                }
+                if (changed) persist(path)
+            }
+        }
+        return count
+    }
+
+    /** 批量修改分组属性。返回处理条数。 */
+    fun updateGroups(ids: Collection<String>, mutate: (com.thousandyearsofwar.ridenotes.model.GroupNode) -> Unit): Int {
+        var count = 0
+        ids.distinct().forEach { id ->
+            index().group(id)?.let {
+                mutate(it)
+                count++
+            }
+        }
+        if (count > 0) saveIndex()
+        return count
+    }
+
+    /** 批量清除标题（多选操作）：按分片归组，每个分片只写一次。返回实际清除的条数。 */
+    fun clearAnchorTitles(items: List<Pair<String, String>>): Int {
+        var cleared = 0
+        inBulk {
+            items.groupBy({ it.first }, { it.second }).forEach { (path, ids) ->
+                val list = mutableAnchors(path)
+                var changed = false
+                ids.forEach { id ->
+                    val anchor = list.firstOrNull { it.id == id } ?: return@forEach
+                    if (anchor.title.isNotEmpty()) {
+                        anchor.title = ""
+                        anchor.updatedAt = java.time.Instant.now().toString()
+                        changed = true
+                        cleared++
+                    }
+                }
+                if (changed) persist(path)
+            }
+        }
+        return cleared
+    }
+
     fun updateAnchorTitle(relativePath: String, anchorId: String, title: String) {
         mutableAnchors(relativePath).firstOrNull { it.id == anchorId }?.let {
             it.title = title
@@ -520,46 +725,86 @@ class NoteAnchorService(private val project: Project) {
         }
     }
 
-    /** 把分组放到 parentId 下、混排顺序的第 index 位。 */
+    // ------------------------------------------------------------------
+    // 混排顺序（schema 3）：组和锚点共用 orderValue，可以任意穿插
+    // ------------------------------------------------------------------
+
+    /**
+     * 把分组放到 parentId 下、第 index 位（index 是在"组+锚点"混排列表里的位置）。
+     */
     fun placeGroup(id: String, parentId: String?, index: Int) {
         val index0 = index()
         val group = index0.group(id) ?: return
-        if (parentId == id) return
+        if (parentId == id || isAncestor(id, parentId)) return
+
+        val keys = mixedKeys(parentId, excludeGroupId = id)
+        val orderValue = orderAt(keys, index)
         group.parentId = parentId
-        val merged = index0.groups.filter { it.parentId == parentId && it !== group }
-            .sortedBy { it.order }
-            .toMutableList()
-        merged.add(index.coerceIn(0, merged.size), group)
-        merged.forEachIndexed { i, g -> g.order = i }
+        group.orderValue = orderValue
+        group.order = index
         saveIndex()
     }
 
-    /** 把锚点放到 groupId 下、该组锚点顺序的第 index 位（组内重新编号，跨分片写回）。 */
+    /** 把锚点放到 groupId 下、混排列表里的第 index 位。 */
     fun placeAnchor(anchorId: String, groupId: String?, index: Int) {
         val (path, anchor) = findAnchor(anchorId) ?: return
+        val keys = mixedKeys(groupId, excludeAnchorId = anchorId)
+        val orderValue = orderAt(keys, index)
         anchor.groupId = groupId
+        anchor.orderValue = orderValue
+        persist(path)
+    }
 
-        val siblings = allAnchors()
-            .filter { it.groupId == groupId && it.id != anchorId }
-            .sortedWith(compareBy({ it.orderValue }, { it.startLine }))
-            .toMutableList()
-        siblings.add(index.coerceIn(0, siblings.size), anchor)
-        siblings.forEachIndexed { i, a -> a.orderValue = (i + 1).toDouble() }
+    /** 直接指定顺序键（拖拽到两行之间时用中点，不需要重排其他项）。 */
+    fun moveGroupTo(id: String, parentId: String?, orderValue: Double) {
+        val group = index().group(id) ?: return
+        if (parentId == id || isAncestor(id, parentId)) return
+        group.parentId = parentId
+        group.orderValue = orderValue
+        saveIndex()
+    }
 
-        // 把改动过的锚点按分片归组，每个分片只写一次
-        val byPath = mutableMapOf<String, MutableList<Anchor>>()
-        siblings.forEach { a ->
-            val p = if (a.id == anchor.id) path else findAnchor(a.id)?.first
-            if (p != null) byPath.getOrPut(p) { mutableListOf() }.add(a)
+    fun moveAnchorTo(anchorId: String, groupId: String?, orderValue: Double) {
+        updateAnchor(anchorId) {
+            it.groupId = groupId
+            it.orderValue = orderValue
         }
-        byPath.forEach { (p, list) ->
-            val target = mutableAnchors(p)
-            list.forEach { changed ->
-                target.firstOrNull { it.id == changed.id }?.orderValue = changed.orderValue
-                target.firstOrNull { it.id == changed.id }?.groupId = changed.groupId
-            }
+    }
+
+    /** 某个父级下所有子项的顺序键（组 + 锚点），已排序。 */
+    private fun mixedKeys(
+        parentId: String?,
+        excludeGroupId: String? = null,
+        excludeAnchorId: String? = null
+    ): List<Double> {
+        val keys = mutableListOf<Double>()
+        index().groups.filter { it.parentId == parentId && it.id != excludeGroupId }
+            .forEach { keys.add(it.orderValue) }
+        allAnchors().filter { it.groupId == parentId && it.id != excludeAnchorId }
+            .forEach { keys.add(it.orderValue) }
+        return keys.sorted()
+    }
+
+    /** 在已排序的键列表里插入到第 index 位时应该用的键值（取相邻中点）。 */
+    private fun orderAt(sortedKeys: List<Double>, index: Int): Double {
+        val pos = index.coerceIn(0, sortedKeys.size)
+        return when {
+            sortedKeys.isEmpty() -> 1.0
+            pos == 0 -> sortedKeys.first() - 1.0
+            pos >= sortedKeys.size -> sortedKeys.last() + 1.0
+            else -> (sortedKeys[pos - 1] + sortedKeys[pos]) / 2.0
         }
-        byPath.keys.forEach { persist(it) }
+    }
+
+    /** id 是否是 candidate 的祖先（防止把分组拖进自己的子树）。 */
+    private fun isAncestor(id: String, candidate: String?): Boolean {
+        var cursor = candidate?.let { index().group(it) }
+        var guard = 0
+        while (cursor != null && guard++ < 64) {
+            if (cursor.id == id) return true
+            cursor = cursor.parentId?.let { index().group(it) }
+        }
+        return false
     }
 
     /** 编辑器里用的实际颜色：单条覆盖 > 组色 > 自身色。 */

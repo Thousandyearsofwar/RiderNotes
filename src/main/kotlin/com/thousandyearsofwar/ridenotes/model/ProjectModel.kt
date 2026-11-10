@@ -15,6 +15,8 @@ class GroupNode(
     var visible: Boolean = true,
     var parentId: String? = null,
     override var order: Int = 0,
+    /** 与锚点共用的混排顺序键（schema 3 起）：组和锚点可以任意穿插。 */
+    var orderValue: Double = 0.0,
     var locked: Boolean = false,
     var compact: Boolean = false,
     var tags: MutableList<String> = mutableListOf()
@@ -61,7 +63,9 @@ class ProjectIndex(
     /** 面板折叠的分组（UI 状态，持久化以便重启保持）。 */
     var collapsedGroups: MutableList<String> = mutableListOf(),
     /** 面板里展开子笔记的锚点。 */
-    var expandedAnchors: MutableList<String> = mutableListOf()
+    var expandedAnchors: MutableList<String> = mutableListOf(),
+    /** 新建锚点默认落入的分组；null 表示根级。 */
+    var defaultGroupId: String? = null
 ) {
     fun group(id: String?): GroupNode? {
         if (id == null) return null

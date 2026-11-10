@@ -369,6 +369,8 @@ class AnchorRenderService(private val project: Project) {
         val desired = LinkedHashMap<String, Pair<Anchor, com.intellij.openapi.util.TextRange>>()
 
         anchors.forEach { anchor ->
+            // 克隆节点只是面板里的别名，不在代码区渲染任何东西
+            if (anchor.mirrorOf != null) return@forEach
             if (!service.effectiveVisible(anchor)) return@forEach
 
             val liveRange = live[anchor.id]
@@ -435,7 +437,7 @@ class AnchorRenderService(private val project: Project) {
                 existing.anchor = anchor
                 if (anchorReplaced) {
                     existing.highlighter.gutterIconRenderer =
-                        gutterFor(anchor, color) { state.beginEdit(anchor, null, null) }
+                        gutterFor(project, anchor, color) { announceActivation(anchor) }
                 }
 
                 if (existing.contentSignature != signature || anchorReplaced) {
@@ -460,15 +462,25 @@ class AnchorRenderService(private val project: Project) {
         )
     }
 
+    /** gutter 图标被点击：通知面板把列表滚动并选中到该锚点。 */
+    private fun announceActivation(anchor: Anchor) {
+        runCatching {
+            project.messageBus
+                .syncPublisher(com.thousandyearsofwar.ridenotes.ui.AnchorActivationTopic.TOPIC)
+                .anchorActivated(anchor.id)
+        }
+    }
+
     /** 标题/笔记内容/外观设置/简洁开关变了才需要重建摘要块。 */
     private fun contentSignature(anchor: Anchor, color: Int): String {
         val settings = com.thousandyearsofwar.ridenotes.settings.NotesSettings.get()
-        val compact = NoteAnchorService.get(project).effectiveCompact(anchor)
+        val service = NoteAnchorService.get(project)
+        val compact = service.effectiveCompact(anchor)
         return buildString {
             append(settings.maxWidth).append(':').append(settings.fontSize).append(':').append(color)
             append(':').append(if (compact) 1 else 0)
-            append('|').append(anchor.title)
-            anchor.notes.forEach { note ->
+            append('|').append(service.resolvedTitle(anchor))
+            service.resolvedNotes(anchor).forEach { note ->
                 append('|').append(note.id).append(':').append(note.updatedAt).append(':').append(note.body.length)
             }
         }
@@ -575,11 +587,17 @@ class AnchorRenderService(private val project: Project) {
         /** 就地编辑：编辑框正好盖在摘要块上。 */
         fun beginEdit(anchor: Anchor, inlay: Inlay<*>?, noteId: String? = null) {
             val service = NoteAnchorService.get(project)
+            if (anchor.mirrorOf != null) {
+                com.thousandyearsofwar.ridenotes.util.NoteLog.notify(
+                    project, "这是克隆锚点，请到源锚点编辑"
+                )
+                return
+            }
             if (service.effectiveLocked(anchor)) {
                 com.thousandyearsofwar.ridenotes.util.NoteLog.notify(project, "该笔记已锁定，请在 Notes 面板中编辑")
                 return
             }
-            val note = anchor.notes.firstOrNull { it.id == noteId } ?: anchor.notes.firstOrNull()
+            val note = service.resolvedNotes(anchor).firstOrNull { it.id == noteId } ?: service.resolvedNotes(anchor).firstOrNull()
             val bounds = inlay?.let { runCatching { it.bounds }.getOrNull() }
 
             // 编辑时先把这一锚点的所有摘要块收起来，避免两层颜色叠加
@@ -633,7 +651,7 @@ class AnchorRenderService(private val project: Project) {
 
             val item = Painted(anchor, highlighter, color)
             item.contentSignature = signature
-            highlighter.gutterIconRenderer = gutterFor(anchor, color) { beginEdit(anchor, null, null) }
+            highlighter.gutterIconRenderer = gutterFor(project, anchor, color) { announceActivation(anchor) }
             painted.add(item)
             if (withBlock) addInlays(item, signature)
         }
@@ -693,8 +711,8 @@ class AnchorRenderService(private val project: Project) {
             // 摘要总开关：关掉后只有色带 + gutter 图标
             if (!com.thousandyearsofwar.ridenotes.settings.NotesSettings.get().showSummary) return
 
-            // 一条笔记一个块；标题并进第一个块的首行
-            val title = item.anchor.title.trim()
+
+            // 一条笔记一个块；标题只在面板/悬停里显示，不再占用代码区
             val blocks = mutableListOf<Pair<String?, List<String>>>()
 
             fun noteLines(note: com.thousandyearsofwar.ridenotes.model.Note): List<String> {
@@ -703,21 +721,20 @@ class AnchorRenderService(private val project: Project) {
                 return body.lines()
             }
 
-            item.anchor.notes.forEach { note ->
+            service.resolvedNotes(item.anchor).forEach { note ->
                 val lines = if (compact) note.body.trim().lines().take(1) else noteLines(note)
                 if (lines.isEmpty() || lines.all { it.isBlank() }) return@forEach
                 blocks.add(note.id to lines)
             }
 
-            if (blocks.isEmpty() && title.isEmpty()) {
+            if (blocks.isEmpty()) {
                 blocks.add(null to listOf("空笔记 · 双击编辑"))
             }
 
             blocks.forEachIndexed { index, (noteId, lines) ->
-                val withTitle = index == 0 && title.isNotEmpty()
-                val text = if (withTitle) (listOf(title) + lines).joinToString("\n") else lines.joinToString("\n")
-                val note = item.anchor.notes.firstOrNull { it.id == noteId }
-                val stamps = if (note == null) emptyMap() else mapOf((if (withTitle) 1 else 0) to stampOf(note))
+                val text = lines.joinToString("\n")
+                val note = service.resolvedNotes(item.anchor).firstOrNull { it.id == noteId }
+                val stamps = if (note == null) emptyMap() else mapOf(0 to stampOf(note))
 
                 val inlay = editor.inlayModel.addBlockElement(
                     offset, true, false, 50,
@@ -781,13 +798,16 @@ class AnchorRenderService(private val project: Project) {
         NOTE_STAMP_FORMAT.format(java.time.Instant.parse(note.createdAt))
     }.getOrDefault("")
 
-    private fun gutterFor(anchor: Anchor, color: Int, onClick: () -> Unit): GutterIconRenderer = object : GutterIconRenderer() {
+    private fun gutterFor(project: Project, anchor: Anchor, color: Int, onClick: () -> Unit): GutterIconRenderer = object : GutterIconRenderer() {
         override fun getIcon(): Icon = NoteGutterIcon(color)
 
         override fun getTooltipText(): String = buildString {
-            append(anchor.displayTitle)
-            if (anchor.notes.isNotEmpty()) append("  ·  ${anchor.notes.size} 条")
-            anchor.notes.firstOrNull()?.let { append("\n").append(it.body.take(80)) }
+            val svc = com.thousandyearsofwar.ridenotes.service.NoteAnchorService.get(project)
+            append(svc.resolvedTitle(anchor).ifBlank { anchor.displayTitle })
+            val resolved = svc.resolvedNotes(anchor)
+            if (resolved.isNotEmpty()) append("  ·  ${resolved.size} 条")
+            resolved.firstOrNull()?.let { append("\n").append(it.body.take(80)) }
+            if (anchor.mirrorOf != null) append("\n（克隆锚点，跟随源锚点）")
             append("\n双击就地编辑")
         }
 

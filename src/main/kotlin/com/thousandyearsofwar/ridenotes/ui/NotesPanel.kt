@@ -49,7 +49,13 @@ class GroupRow(val group: GroupNode, depth: Int) : Row(depth) {
     override val id: String get() = group.id
 }
 
-class NoteRow(val relativePath: String, val anchor: Anchor, depth: Int) : Row(depth) {
+class NoteRow(
+    val relativePath: String,
+    val anchor: Anchor,
+    depth: Int,
+    /** 刷新时算好的"原文已变更"标记，渲染器只读这个字段，不做任何 I/O。 */
+    val changed: Boolean = false
+) : Row(depth) {
     override val id: String get() = anchor.id
 }
 
@@ -141,8 +147,18 @@ private class NotesTable(model: javax.swing.table.TableModel) : JTable(model) {
     /** 拖拽中：屏蔽 JTable 自带的"拖动扩选"行为（否则经过的行都会被选中）。 */
     var dragging: Boolean = false
 
+    /** 多选状态下按住其中一行准备拖动：不要立刻把选区塌缩成一行。 */
+    var suppressCollapse: Boolean = false
+
     override fun changeSelection(rowIndex: Int, columnIndex: Int, toggle: Boolean, extend: Boolean) {
         if (dragging) return
+        if (suppressCollapse && !toggle && !extend && isRowSelected(rowIndex)) return
+        // 多选状态下点"显示/锁定/简洁"开关列：不要让表格把选区塌缩成单行
+        if (!toggle && !extend && selectedRowCount > 1 &&
+            columnIndex in intArrayOf(COL_VISIBLE, COL_LOCK, COL_COMPACT) && isRowSelected(rowIndex)
+        ) {
+            return
+        }
         super.changeSelection(rowIndex, columnIndex, toggle, extend)
     }
 
@@ -245,6 +261,16 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     init {
+        // 编辑器 gutter 图标点击 → 列表跳转
+        runCatching {
+            project.messageBus.connect(project).subscribe(
+                AnchorActivationTopic.TOPIC,
+                AnchorActivationTopic.Listener { anchorId ->
+                    javax.swing.SwingUtilities.invokeLater { revealAnchor(anchorId) }
+                }
+            )
+        }
+
         border = JBUI.Borders.empty(4)
         // 浮动工具窗在 Windows 11 下带半透明（Mica），编辑器里的笔记会"透"上来。
         // 面板自身刷成不透明，避免看起来像笔记穿过了面板。
@@ -295,18 +321,20 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
                                 if (item.group.id in collapsed) "\u25B8 " else "\u25BE "
                             } else "  "
                             label.icon = AllIcons.Nodes.Folder
-                            label.text = "<html><b>${escape(arrow + item.group.title.ifBlank { "未命名分组" })}</b>" +
+                            val defaultMark = if (item.group.id == service.defaultGroupId()) " <font color=\u0027#8a8a8a\u0027>默认</font>" else ""
+                                label.text = "<html><b>${escape(arrow + item.group.title.ifBlank { "未命名分组" })}</b>$defaultMark" +
                                 flagsOf(item.group.visible, item.group.locked, item.group.compact) +
                                 tagChipsOf(item.group.tags) + "</html>"
                         }
 
                         is NoteRow -> {
                             label.icon = DotIcon(NotePalette.accent(service.effectiveColor(item.anchor)))
-                            val arrow = if (item.anchor.notes.size > 1) {
+                            val anchorNotes = service.resolvedNotes(item.anchor)
+                            val arrow = if (anchorNotes.size > 1) {
                                 if (item.anchor.id in expandedNotes) "\u25BE " else "\u25B8 "
                             } else "  "
-                            val previewRaw = item.anchor.notes.firstOrNull()?.body?.replace("\n", " ")?.trim().orEmpty()
-                            val tagsPlain = item.anchor.notes.flatMap { it.tags }.distinct()
+                            val previewRaw = anchorNotes.firstOrNull()?.body?.replace("\n", " ")?.trim().orEmpty()
+                            val tagsPlain = anchorNotes.flatMap { it.tags }.distinct()
                                 .joinToString(" ") { "#$it" }
                             val where = "${shortPath(item.relativePath)}:${item.anchor.startLine}"
                             val wherePlain = "\u2014 $where"
@@ -316,23 +344,23 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
                             val used = fm.stringWidth(arrow + item.anchor.displayTitle) +
                                 fm.stringWidth(tagsPlain) +
                                 fm.stringWidth(wherePlain) +
-                                (if (textChanged(item.relativePath, item.anchor)) 60 else 0) +
+                                (if (item.changed) 60 else 0) +
                                 90
                             val preview = fitText(
                                 previewRaw, fm,
                                 (rowTextWidth(table, item.depth) - used).coerceAtLeast(0)
                             )
-                            val warn = if (textChanged(item.relativePath, item.anchor)) {
+                            val warn = if (item.changed) {
                                 " <span style='color:#d05a5a'>\u26A0已变更</span>"
                             } else ""
                             // 标签放在预览前面：预览一长，行尾的标签就会被挤掉看不见
-                            label.text = "<html><b>${escape(arrow + item.anchor.displayTitle)}</b>" +
+                            label.text = "<html><b>${escape(arrow + (if (item.anchor.mirrorOf != null) "⧉ " else "") + service.resolvedTitle(item.anchor).ifBlank { item.anchor.displayTitle })}</b>" +
                                 flagsOf(
                                     service.effectiveVisible(item.anchor),
                                     service.effectiveLocked(item.anchor),
                                     service.effectiveCompact(item.anchor)
                                 ) +
-                                tagChipsOf(item.anchor.notes.flatMap { it.tags }) +
+                                tagChipsOf(anchorNotes.flatMap { it.tags }) +
                                 " <span style='color:gray'>${escape(preview)}</span>" +
                                 " <span style='color:#7a7a7a'>\u2014 ${escape(where)}</span>" +
                                 warn + "</html>"
@@ -377,12 +405,17 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
                 lastPoint = e.point
                 if (javax.swing.SwingUtilities.isRightMouseButton(e)) {
                     val row = table.rowAtPoint(e.point)
-                    if (row >= 0) table.setRowSelectionInterval(row, row)
+                    // 右键点在已选中的行上时保留整个选区，只有点到选区外才重新选中
+                    if (row >= 0 && !table.isRowSelected(row)) table.setRowSelectionInterval(row, row)
                     showContextMenu(e)
                     return
                 }
                 pressPoint = e.point
                 pressRow = table.rowAtPoint(e.point)
+                val pressedColumn = table.columnAtPoint(e.point)
+                val onToggleColumn = pressedColumn in intArrayOf(COL_VISIBLE, COL_LOCK, COL_COMPACT)
+                table.suppressCollapse = !e.isControlDown && !e.isShiftDown && !onToggleColumn &&
+                    table.selectedRowCount > 1 && pressRow >= 0 && table.isRowSelected(pressRow)
             }
 
             override fun mouseDragged(e: MouseEvent) {
@@ -422,6 +455,13 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
                 pressRow = -1
                 val wasDragging = table.dragging
                 table.dragging = false
+                val moved = start != null && start.distance(e.point) >= 5
+                val collapse = table.suppressCollapse
+                table.suppressCollapse = false
+                if (!moved && collapse && sourceRow >= 0 && table.rowAtPoint(e.point) >= 0) {
+                    // 只有"普通点击多选中的某行"才塌缩；Ctrl/Shift 加选、开关列点击都保留选区
+                    table.setRowSelectionInterval(sourceRow, sourceRow)
+                }
                 if (start == null || sourceRow < 0 || table.dropRow < 0) {
                     table.clearDrop()
                     if (wasDragging) refresh()   // 恢复被拖动扩选打乱的高亮
@@ -453,11 +493,12 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
                             }
 
                             is NoteRow -> {
-                                if (onArrow && item.anchor.notes.size > 1) {
+                                val resolvedCount = service.resolvedNotes(item.anchor).size
+                                if (onArrow && resolvedCount > 1) {
                                     toggleNotes(item.anchor.id)
                                 } else if (e.clickCount >= 2) {
                                     activate(item)
-                                    if (item.anchor.notes.size > 1) toggleNotes(item.anchor.id)
+                                    if (resolvedCount > 1) toggleNotes(item.anchor.id)
                                 }
                             }
 
@@ -499,7 +540,10 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
             menu.add(com.thousandyearsofwar.ridenotes.RiderNotesBundle.message("panel.refresh")).addActionListener { refresh() }
             menu.add(com.thousandyearsofwar.ridenotes.RiderNotesBundle.message("panel.cleanup")).addActionListener { pruneOrphanPlacements() }
             menu.addSeparator()
+            menu.addSeparator()
+            menu.add("移除所选标题").addActionListener { removeTitles() }
             menu.add("从 IDE 书签导入…").addActionListener { importBookmarks() }
+            menu.add("恢复为 IDE 书签…").addActionListener { restoreBookmarks() }
             menu.add("导出 Markdown 到剪贴板").addActionListener { exportMarkdown() }
             menu.add("导出 PR 评论到剪贴板").addActionListener { exportPullRequest() }
             menu.show(moreButton, 0, moreButton.height)
@@ -560,6 +604,24 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
 
         // 行号锚定：所有笔记都留在自己的分组里，只在行上标 ⚠
+        // ⚠ 在刷新时一次性算好（读锁内），渲染器只读字段，避免 paint 期间做 I/O
+        val changedById = com.intellij.openapi.application.ApplicationManager.getApplication()
+            .runReadAction<Map<String, Boolean>> {
+                val result = HashMap<String, Boolean>(anchorIndex.size)
+                anchorIndex.values.forEach { (path, anchor) ->
+                    val file = fileOf(path)
+                    val document = file?.let {
+                        com.intellij.openapi.fileEditor.FileDocumentManager.getInstance().getDocument(it)
+                    }
+                    result[anchor.id] = when {
+                        file == null -> true
+                        document == null -> false
+                        else -> com.thousandyearsofwar.ridenotes.model.Anchoring.textChanged(document, anchor)
+                    }
+                }
+                result
+            }
+
         // 有筛选时忽略折叠状态，自动展开命中的分组
         val filtering = isFiltering()
 
@@ -571,28 +633,53 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
 
         fun build(groupId: String?, depth: Int): MutableList<Row> {
             val out = mutableListOf<Row>()
-            index.groups.filter { it.parentId == groupId }.sortedBy { it.order }.forEach { group ->
-                val children = build(group.id, depth + 1)
-                if (children.isNotEmpty() || !filtering) {
-                    out.add(GroupRow(group, depth))
-                    if (filtering || group.id !in collapsed) out.addAll(children)
-                }
-            }
-            anchorsOf(groupId).forEach { (path, anchor) ->
-                if (!matchesFilter(anchor, path)) return@forEach
-                out.add(NoteRow(path, anchor, depth))
-                if (anchor.notes.size > 1 && (filtering || anchor.id in expandedNotes)) {
-                    anchor.notes.forEach { note -> out.add(NoteItemRow(path, anchor, note, depth + 1)) }
+
+            // 组和锚点共用 orderValue，可以任意穿插（schema 3）
+            val children = mutableListOf<Triple<Double, Int, Any>>()
+            index.groups.filter { it.parentId == groupId }
+                .forEach { children.add(Triple(it.orderValue, 0, it)) }
+            anchorsOf(groupId).forEach { pair -> children.add(Triple(pair.second.orderValue, 1, pair)) }
+            children.sortWith(compareBy({ it.first }, { it.second }))
+
+            children.forEach { child ->
+                if (child.second == 0) {
+                    val group = child.third as GroupNode
+                    val nested = build(group.id, depth + 1)
+                    if (nested.isNotEmpty() || !filtering) {
+                        out.add(GroupRow(group, depth))
+                        if (filtering || group.id !in collapsed) out.addAll(nested)
+                    }
+                } else {
+                    @Suppress("UNCHECKED_CAST")
+                    val (path, anchor) = child.third as Pair<String, Anchor>
+                    if (!matchesFilter(anchor, path)) return@forEach
+                    out.add(NoteRow(path, anchor, depth, changedById[anchor.id] ?: false))
+                    if (anchor.notes.size > 1 && (filtering || anchor.id in expandedNotes)) {
+                        anchor.notes.forEach { note -> out.add(NoteItemRow(path, anchor, note, depth + 1)) }
+                    }
                 }
             }
             return out
         }
 
+        // 重建前记住整个选区（多选也要保留），重建后按行 id 逐个恢复
+        val previousSelection = table.selectedRows.toList()
+            .mapNotNull { model.rows.getOrNull(it)?.id }
+            .ifEmpty { listOfNotNull(selectedId) }
+
         val rows = build(null, 0)
         model.replace(rows)
-        if (selectedId != null) {
-            val target = rows.indexOfFirst { it.id == selectedId }
-            if (target >= 0) table.setRowSelectionInterval(target, target)
+
+        if (previousSelection.isNotEmpty()) {
+            val targets = previousSelection.mapNotNull { id ->
+                rows.indexOfFirst { it.id == id }.takeIf { it >= 0 }
+            }
+            if (targets.isNotEmpty()) {
+                table.selectionModel.clearSelection()
+                targets.forEach { table.addRowSelectionInterval(it, it) }
+                table.selectionModel.anchorSelectionIndex = targets.first()
+                table.selectionModel.leadSelectionIndex = targets.last()
+            }
         }
     }
 
@@ -681,6 +768,38 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
         AnchorRenderService.get(project).refreshAll()
         refresh()
+    }
+
+    /** 从锚点重建 IDE 书签（撤销“导入并删除”）。 */
+    private fun restoreBookmarks() {
+        val imported = runCatching {
+            service.anchorsSnapshot().count { it.createdBy == "bookmark-import" }
+        }.getOrDefault(0)
+        if (imported == 0) {
+            com.thousandyearsofwar.ridenotes.util.NoteLog.notify(project, "没有从书签导入的锚点可恢复")
+            return
+        }
+        val choice = Messages.showYesNoDialog(
+            project,
+            "将把 $imported 条从书签导入的锚点重新写成 IDE 书签。\n\n" +
+                "· 位置按锚点当前所在行恢复\n" +
+                "· 描述写回书签\n" +
+                "· 分组名沿用锚点所在分组\n\n" +
+                "继续吗？",
+            "恢复为 IDE 书签",
+            "恢复",
+            "取消",
+            null
+        )
+        if (choice != Messages.YES) return
+
+        val result = runCatching { BookmarkImporter.restore(project) }.getOrElse {
+            com.thousandyearsofwar.ridenotes.util.NoteLog.warn("bookmark restore failed: ${it.message}")
+            return
+        }
+        com.thousandyearsofwar.ridenotes.util.NoteLog.notify(
+            project, "已恢复 ${result.created} 个书签（跳过 ${result.skipped} 个）"
+        )
     }
 
     /** 导出到剪贴板：Markdown 报告 / PR 评论格式。 */
@@ -795,6 +914,10 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     private fun addNoteDialog(row: NoteRow) {
+        if (row.anchor.mirrorOf != null) {
+            com.thousandyearsofwar.ridenotes.util.NoteLog.notify(project, "这是克隆锚点，请到源锚点追加笔记")
+            return
+        }
         if (service.effectiveLocked(row.anchor)) {
             com.thousandyearsofwar.ridenotes.util.NoteLog.notify(project, "该笔记已锁定，先解锁再追加")
             return
@@ -846,6 +969,40 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
 
         val point = lastPoint ?: java.awt.Point(20, 20)
         menu.show(table, point.x, point.y)
+    }
+
+    /** 多选打标签：分组加/删组标签，笔记行作用于其全部笔记，单条笔记行作用于该条。 */
+    private fun attachTagToSelection() {
+        val groups = selectedGroupRows()
+        val noteRows = selectedNoteRows()
+        val noteItems = selectedNoteItems()
+        if (groups.isEmpty() && noteRows.isEmpty() && noteItems.isEmpty()) return
+
+        val applied = mutableSetOf<String>()
+        groups.forEach { applied.addAll(it.group.tags) }
+        noteItems.forEach { applied.addAll(it.note.tags) }
+        noteRows.forEach { row -> row.anchor.notes.firstOrNull()?.let { applied.addAll(it.tags) } }
+
+        chooseTag(applied) { name ->
+            applyToSelection("修改标签") {
+                groups.forEach { group ->
+                    if (group.group.tags.contains(name)) service.removeTagFromGroup(group.group.id, name)
+                    else service.addTagToGroup(group.group.id, name)
+                }
+                noteRows.forEach { row ->
+                    val file = fileOf(row.relativePath) ?: return@forEach
+                    row.anchor.notes.forEach { note ->
+                        if (note.tags.contains(name)) service.removeTagFromNote(file, row.anchor.id, note.id, name)
+                        else service.addTagToNote(file, row.anchor.id, note.id, name)
+                    }
+                }
+                noteItems.forEach { item ->
+                    val file = fileOf(item.relativePath) ?: return@forEach
+                    if (item.note.tags.contains(name)) service.removeTagFromNote(file, item.anchor.id, item.note.id, name)
+                    else service.addTagToNote(file, item.anchor.id, item.note.id, name)
+                }
+            }
+        }
     }
 
     private fun attachTagToGroup(row: GroupRow) {
@@ -932,13 +1089,6 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
         if (compact) append(" <span style='color:gray'>[简洁]</span>")
     }
 
-    /** 记录时的原文是否还和当前位置对得上（只用于显示 ⚠）。 */
-    private fun textChanged(relativePath: String, anchor: Anchor): Boolean {
-        val file = fileOf(relativePath) ?: return true
-        val document = com.intellij.openapi.fileEditor.FileDocumentManager.getInstance()
-            .getDocument(file) ?: return false
-        return com.thousandyearsofwar.ridenotes.model.Anchoring.textChanged(document, anchor)
-    }
 
     private fun shortPath(path: String): String {
         val parts = path.split('/')
@@ -963,30 +1113,56 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
     // ---------------------------------------------------------------- 拖动
 
     private fun dropRow(sourceRow: Int, e: MouseEvent) {
-        val source = model.rows.getOrNull(sourceRow) ?: return
-        val targetRow = table.rowAtPoint(e.point)
-        val target = model.rows.getOrNull(targetRow) ?: return
+        val target = model.rows.getOrNull(table.rowAtPoint(e.point)) ?: return
         val mode = table.dropMode
-        val index = service.index()
 
-        // 分组内部：组在前（按 order），锚点在后（按 orderValue）
-        fun groupsOf(parentId: String?): List<com.thousandyearsofwar.ridenotes.model.GroupNode> =
-            index.groups.filter { it.parentId == parentId }.sortedBy { it.order }
+        // 多选时整批拖动；单选时只动按下的那一行
+        val dragged = if (table.isRowSelected(sourceRow) && table.selectedRowCount > 1) {
+            table.selectedRows.toList().mapNotNull { model.rows.getOrNull(it) }
+        } else {
+            listOfNotNull(model.rows.getOrNull(sourceRow))
+        }.filter { it is GroupRow || it is NoteRow }
+        if (dragged.isEmpty()) return
 
-        fun anchorsOf(parentId: String?): List<Pair<String, Anchor>> =
-            anchorIndex.values.filter { it.second.groupId == parentId }
-                .sortedWith(compareBy({ it.second.orderValue }, { it.second.startLine }))
+        val sourceGroupIds = dragged.filterIsInstance<GroupRow>().map { it.group.id }.toSet()
+        val sourceAnchorIds = dragged.filterIsInstance<NoteRow>().map { it.anchor.id }.toSet()
 
-        fun groupIndex(parentId: String?, targetGroup: com.thousandyearsofwar.ridenotes.model.GroupNode, after: Boolean): Int {
-            val list = groupsOf(parentId).filter { it.id != (source as? GroupRow)?.group?.id }
-            val pos = list.indexOfFirst { it.id == targetGroup.id }
-            return if (pos < 0) list.size else pos + if (after) 1 else 0
+        // 目标父级下的混排列表（不含被拖动的项）
+        fun siblings(parentId: String?): List<Pair<Double, Any>> {
+            val list = mutableListOf<Pair<Double, Any>>()
+            service.index().groups
+                .filter { it.parentId == parentId && it.id !in sourceGroupIds }
+                .forEach { list.add(it.orderValue to it) }
+            anchorIndex.values
+                .filter { it.second.groupId == parentId && it.second.id !in sourceAnchorIds }
+                .forEach { list.add(it.second.orderValue to it.second) }
+            return list.sortedBy { it.first }
         }
 
-        fun anchorIndexAt(parentId: String?, targetAnchor: Anchor, after: Boolean): Int {
-            val list = anchorsOf(parentId).filter { it.second.id != (source as? NoteRow)?.anchor?.id }
-            val pos = list.indexOfFirst { it.second.id == targetAnchor.id }
-            return if (pos < 0) list.size else pos + if (after) 1 else 0
+        // 在第 pos 位插入 n 项时可用的顺序键（夹在相邻两项之间均分）
+        fun batchKeys(values: List<Double>, pos: Int, n: Int): List<Double> {
+            val before = if (pos > 0) values[pos - 1] else null
+            val after = if (pos < values.size) values[pos] else null
+            return when {
+                before == null && after == null -> (1..n).map { it.toDouble() }
+                before == null -> (1..n).map { after!! - (n - it + 1) }
+                after == null -> (0 until n).map { before + it + 1.0 }
+                else -> (1..n).map { before + (after - before) * it / (n + 1) }
+            }
+        }
+
+        fun apply(parentId: String?, keys: List<Double>) {
+            dragged.forEachIndexed { index, row ->
+                val key = keys.getOrElse(index) { keys.lastOrNull() ?: 1.0 }
+                when (row) {
+                    is GroupRow -> if (!isGroupInside(row.group.id, parentId)) {
+                        service.moveGroupTo(row.group.id, parentId, key)
+                    }
+
+                    is NoteRow -> service.moveAnchorTo(row.anchor.id, parentId, key)
+                    else -> Unit
+                }
+            }
         }
 
         when (target) {
@@ -994,31 +1170,25 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
 
             is GroupRow -> {
                 if (mode == 1) {
-                    // 拖进分组：组上移，锚点放到该组锚点列表末尾
-                    val anchorCount = anchorsOf(target.group.id).size
-                    when (source) {
-                        is GroupRow -> service.placeGroup(source.group.id, target.group.id, 0)
-                        is NoteRow -> service.placeAnchor(source.anchor.id, target.group.id, anchorCount)
-                        else -> Unit
-                    }
+                    // 拖进分组：整批放到该组子项末尾
+                    val list = siblings(target.group.id)
+                    val base = list.lastOrNull()?.first ?: 0.0
+                    apply(target.group.id, dragged.indices.map { base + it + 1.0 })
                 } else {
                     val parentId = target.group.parentId
-                    when (source) {
-                        is GroupRow -> service.placeGroup(source.group.id, parentId, groupIndex(parentId, target.group, mode == 2))
-                        // 锚点拖到分组行前/后：放进该父级的锚点列表末尾（组在前、锚点在后）
-                        is NoteRow -> service.placeAnchor(source.anchor.id, parentId, anchorsOf(parentId).size)
-                        else -> Unit
-                    }
+                    val list = siblings(parentId)
+                    val pos = list.indexOfFirst { it.second === target.group }
+                    val at = if (pos < 0) list.size else pos + if (mode == 2) 1 else 0
+                    apply(parentId, batchKeys(list.map { it.first }, at, dragged.size))
                 }
             }
 
             is NoteRow -> {
                 val parentId = target.anchor.groupId
-                when (source) {
-                    is GroupRow -> service.placeGroup(source.group.id, parentId, 0)
-                    is NoteRow -> service.placeAnchor(source.anchor.id, parentId, anchorIndexAt(parentId, target.anchor, mode == 2))
-                    else -> Unit
-                }
+                val list = siblings(parentId)
+                val pos = list.indexOfFirst { it.second === target.anchor }
+                val at = if (pos < 0) list.size else pos + if (mode == 2) 1 else 0
+                apply(parentId, batchKeys(list.map { it.first }, at, dragged.size))
             }
         }
 
@@ -1026,44 +1196,122 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
         refresh()
     }
 
+    /** parentId 是否在 groupId 的子树里（把组拖进自己子树会成环）。 */
+    private fun isGroupInside(groupId: String, parentId: String?): Boolean {
+        var cursor = parentId?.let { service.index().group(it) }
+        var guard = 0
+        while (cursor != null && guard++ < 64) {
+            if (cursor.id == groupId) return true
+            cursor = cursor.parentId?.let { service.index().group(it) }
+        }
+        return false
+    }
     // ---------------------------------------------------------------- 动作
 
     private fun selectedRow(): Row? = model.rows.getOrNull(table.selectedRow)
 
-    private fun toggleVisible(row: Row) {
-        undoable(fileOfRow(row), "切换显示") {
-            when (row) {
-                is GroupRow -> service.setGroupVisible(row.group.id, !row.group.visible)
-                is NoteRow -> service.setAnchorVisible(row.anchor.id, !service.effectiveVisible(row.anchor))
-                else -> Unit
-            }
-        }
+    // ---------------------------------------------------------------- 多选
+
+    private fun selectionRows(): List<Row> = table.selectedRows.toList().mapNotNull { model.rows.getOrNull(it) }
+
+    private fun selectedNoteRows(): List<NoteRow> = selectionRows().filterIsInstance<NoteRow>()
+
+    private fun selectedGroupRows(): List<GroupRow> = selectionRows().filterIsInstance<GroupRow>()
+
+    private fun selectedNoteItems(): List<NoteItemRow> = selectionRows().filterIsInstance<NoteItemRow>()
+
+    /** 把操作套到整个选区上，并注册跨文件的撤销点。 */
+    private fun applyToSelection(name: String, action: () -> Unit) {
+        val files = selectionRows().mapNotNull { fileOfRow(it) }.distinct()
+        if (files.size <= 1) undoable(files.firstOrNull(), name, action) else undoableFiles(files, name, action)
         AnchorRenderService.get(project).refreshAll()
         refresh()
     }
 
-    private fun toggleLock(row: Row) {
-        undoable(fileOfRow(row), "切换锁定") {
-            when (row) {
-                is GroupRow -> service.setGroupLocked(row.group.id, !row.group.locked)
-                is NoteRow -> service.setAnchorLocked(row.anchor.id, !service.effectiveLocked(row.anchor))
-                else -> Unit
+    private fun toggleVisible(row: Row) = toggleVisibleForSelection()
+    private fun toggleLock(row: Row) = toggleLockForSelection()
+    private fun toggleCompact(row: Row) = toggleCompactForSelection()
+
+    /** 全选区内状态一致时反向切换：有任意一条可见就全部隐藏，否则全部显示。 */
+    private fun toggleVisibleForSelection() {
+        val rows = selectionRows().filter { it is GroupRow || it is NoteRow }
+        if (rows.isEmpty()) return
+        val turnOff = rows.all {
+            when (it) {
+                is GroupRow -> it.group.visible
+                is NoteRow -> service.effectiveVisible(it.anchor)
+                else -> true
             }
         }
-        refresh()
+        val groups = selectedGroupRows().map { it.group.id }
+        val anchors = selectedNoteRows().map { it.relativePath to it.anchor.id }
+        applyToSelection("切换显示") {
+            service.updateGroups(groups) { it.visible = !turnOff }
+            service.updateAnchors(anchors) { it.visible = !turnOff }
+        }
     }
 
-    private fun toggleCompact(row: Row) {
-        undoable(fileOfRow(row), "切换简洁") {
-            when (row) {
-                is GroupRow -> service.setGroupCompact(row.group.id, !row.group.compact)
-                is NoteRow -> service.setAnchorCompact(row.anchor.id, !service.effectiveCompact(row.anchor))
-                else -> Unit
+    private fun toggleLockForSelection() {
+        val rows = selectionRows().filter { it is GroupRow || it is NoteRow }
+        if (rows.isEmpty()) return
+        val turnOn = rows.any {
+            when (it) {
+                is GroupRow -> !it.group.locked
+                is NoteRow -> !service.effectiveLocked(it.anchor)
+                else -> false
             }
         }
-        AnchorRenderService.get(project).refreshAll()
-        refresh()
+        val groups = selectedGroupRows().map { it.group.id }
+        val anchors = selectedNoteRows().map { it.relativePath to it.anchor.id }
+        applyToSelection("切换锁定") {
+            service.updateGroups(groups) { it.locked = turnOn }
+            service.updateAnchors(anchors) { it.locked = turnOn }
+        }
     }
+
+    private fun toggleCompactForSelection() {
+        val rows = selectionRows().filter { it is GroupRow || it is NoteRow }
+        if (rows.isEmpty()) return
+        val turnOn = rows.any {
+            when (it) {
+                is GroupRow -> !it.group.compact
+                is NoteRow -> !service.effectiveCompact(it.anchor)
+                else -> false
+            }
+        }
+        val groups = selectedGroupRows().map { it.group.id }
+        val anchors = selectedNoteRows().map { it.relativePath to it.anchor.id }
+        applyToSelection("切换简洁") {
+            service.updateGroups(groups) { it.compact = turnOn }
+            service.updateAnchors(anchors) { it.compact = turnOn }
+        }
+    }
+
+    private fun applyColor(row: Row, color: Int) = applyColorToSelection(color)
+
+    private fun applyColorToSelection(color: Int) {
+        val groups = selectedGroupRows()
+        val anchors = selectedNoteRows()
+        if (groups.isEmpty() && anchors.isEmpty()) return
+        val locked = groups.any { it.group.locked } || anchors.any { service.effectiveLocked(it.anchor) }
+        if (locked) {
+            com.thousandyearsofwar.ridenotes.util.NoteLog.notify(project, "选区内有已锁定的项，先解锁再改颜色")
+            return
+        }
+        applyToSelection("修改颜色") {
+            service.updateGroups(groups.map { it.group.id }) { it.color = color }
+            service.updateAnchors(anchors.map { it.relativePath to it.anchor.id }) { it.colorOverride = color }
+        }
+    }
+
+    private fun resetColorToGroup() {
+        val anchors = selectedNoteRows()
+        if (anchors.isEmpty()) return
+        applyToSelection("跟随分组颜色") {
+            service.updateAnchors(anchors.map { it.relativePath to it.anchor.id }) { it.colorOverride = null }
+        }
+    }
+
 
     /** 面板里也能 Ctrl+Z：显式把 editor 传给 UndoManager，不依赖焦点。 */
     private fun installUndoKeys() {
@@ -1122,27 +1370,6 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
         } else {
             if (manager.isUndoAvailable(fileEditor)) manager.undo(fileEditor) else manager.undo(null)
         }
-        refresh()
-    }
-
-    private fun applyColor(row: Row, color: Int) {
-        val locked = when (row) {
-            is GroupRow -> row.group.locked
-            is NoteRow -> service.effectiveLocked(row.anchor)
-            else -> false
-        }
-        if (locked) {
-            com.thousandyearsofwar.ridenotes.util.NoteLog.notify(project, "已锁定，先解锁再改颜色")
-            return
-        }
-        undoable(fileOfRow(row), "修改颜色") {
-            when (row) {
-                is GroupRow -> service.setGroupColor(row.group.id, color)
-                is NoteRow -> service.setAnchorColorOverride(row.anchor.id, color)
-                else -> Unit
-            }
-        }
-        AnchorRenderService.get(project).refreshAll()
         refresh()
     }
 
@@ -1298,6 +1525,150 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
         return walk(groupId, 0)?.let { fileOf(it) }
     }
 
+    /** 多文件撤销：对每个分片各存一份快照，撤销时逐个恢复。 */
+    private fun undoableFiles(
+        files: Collection<com.intellij.openapi.vfs.VirtualFile>,
+        name: String,
+        action: () -> Unit
+    ) {
+        val paths = files.mapNotNull { service.relativePath(it) }.distinct()
+        if (paths.isEmpty()) {
+            action()
+            return
+        }
+        val beforeShards = paths.associateWith { service.snapshotShard(it) }
+        val beforeIndex = service.snapshotIndex()
+        action()
+        val afterShards = paths.associateWith { service.snapshotShard(it) }
+        val afterIndex = service.snapshotIndex()
+
+        registerUndo(
+            project, files.first(), name,
+            undo = {
+                beforeShards.forEach { (path, shard) -> service.restore(path, shard, beforeIndex) }
+                AnchorRenderService.get(project).refreshAll()
+                refresh()
+            },
+            redo = {
+                afterShards.forEach { (path, shard) -> service.restore(path, shard, afterIndex) }
+                AnchorRenderService.get(project).refreshAll()
+                refresh()
+            }
+        )
+    }
+
+    /** 多选后批量移除标题。 */
+    private fun removeTitles() {
+        val rows = table.selectedRows.toList().mapNotNull { model.rows.getOrNull(it) }
+        val targets = rows.filterIsInstance<NoteRow>().map { it.relativePath to it.anchor.id }
+        if (targets.isEmpty()) {
+            com.thousandyearsofwar.ridenotes.util.NoteLog.notify(project, "请先选中要移除标题的笔记")
+            return
+        }
+        val files = targets.map { it.first }.distinct().mapNotNull { fileOf(it) }
+        undoableFiles(files, "移除标题") {
+            service.clearAnchorTitles(targets)
+        }
+        AnchorRenderService.get(project).refreshAll()
+        refresh()
+    }
+
+    /** gutter 图标被点击：展开所在分组、滚动并选中该锚点，必要时把工具窗提到前台。 */
+    private fun revealAnchor(anchorId: String) {
+        val entry = anchorIndex[anchorId] ?: return
+
+        // 展开祖先分组
+        var changed = false
+        var cursor = entry.second.groupId?.let { service.index().group(it) }
+        var guard = 0
+        while (cursor != null && guard++ < 64) {
+            if (collapsed.remove(cursor.id)) changed = true
+            cursor = cursor.parentId?.let { service.index().group(it) }
+        }
+        if (changed) refresh()
+
+        var index = model.rows.indexOfFirst { it.id == anchorId }
+        if (index < 0 && isFiltering()) {
+            filterField.text = ""
+            filterTags.clear()
+            refresh()
+            index = model.rows.indexOfFirst { it.id == anchorId }
+        }
+        if (index < 0) return
+
+        table.setRowSelectionInterval(index, index)
+        table.scrollRectToVisible(table.getCellRect(index, 0, true))
+        runCatching {
+            com.intellij.openapi.wm.ToolWindowManager.getInstance(project)
+                .getToolWindow("Sidecar Notes")?.activate(null, true)
+        }
+    }
+
+    /**
+     * 把选中的锚点克隆到编辑器当前选区：位置是新的，内容跟随源锚点。
+     */
+    /** 右键锚点 → 在同一个分组里追加一个克隆节点（不新增代码区间，也不渲染）。 */
+    private fun createCloneNode(row: NoteRow) {
+        val clone = service.createCloneNode(row.anchor.id)
+        if (clone == null) {
+            com.thousandyearsofwar.ridenotes.util.NoteLog.notify(project, "创建克隆节点失败")
+            return
+        }
+        dataDirty = true
+        refresh()
+        com.thousandyearsofwar.ridenotes.util.NoteLog.notify(project, "已创建克隆节点，内容跟随源锚点")
+    }
+    /** 把选中的锚点移进指定分组（null = 根级）。 */
+    private fun moveSelectionToGroup(groupId: String?) {
+        val targets = selectedNoteRows()
+        if (targets.isEmpty()) {
+            com.thousandyearsofwar.ridenotes.util.NoteLog.notify(project, "请先选中要移动的笔记")
+            return
+        }
+        val pairs = targets.map { it.relativePath to it.anchor.id }
+        val files = targets.mapNotNull { fileOf(it.relativePath) }.distinct()
+        undoableFiles(files, "移动到分组") { service.moveAnchorsToGroup(pairs, groupId) }
+        AnchorRenderService.get(project).refreshAll()
+        refresh()
+    }
+
+    /** 新建一个分组，并把当前选中的锚点放进去。 */
+    private fun groupSelectionIntoNewGroup() {
+        val targets = selectedNoteRows()
+        if (targets.isEmpty()) {
+            com.thousandyearsofwar.ridenotes.util.NoteLog.notify(project, "请先选中要分组的笔记")
+            return
+        }
+        val parent = selectedGroupRows().firstOrNull()?.group?.id
+        val title = Messages.showInputDialog(project, "分组名称", "新建分组并放入", null, "新分组", null) ?: return
+        val group = service.createGroup(parent, title.ifBlank { "新分组" })
+        moveSelectionToGroup(group.id)
+    }
+
+    /** 右键菜单里动态生成"移动到分组"子菜单（按层级缩进）。 */
+    private fun buildMoveToGroupMenu(): javax.swing.JMenu {
+        val moveMenu = javax.swing.JMenu("移动到分组")
+        val root = javax.swing.JMenuItem("根级")
+        root.addActionListener { moveSelectionToGroup(null) }
+        moveMenu.add(root)
+        moveMenu.addSeparator()
+
+        fun walk(parentId: String?, depth: Int) {
+            service.index().groups.filter { it.parentId == parentId }
+                .sortedBy { it.orderValue }
+                .forEach { group ->
+                    val item = javax.swing.JMenuItem(
+                        "   ".repeat(depth) + group.title.ifBlank { "未命名分组" }
+                    )
+                    item.addActionListener { moveSelectionToGroup(group.id) }
+                    moveMenu.add(item)
+                    if (depth < 8) walk(group.id, depth + 1)
+                }
+        }
+        walk(null, 0)
+        return moveMenu
+    }
+
     private fun deleteSelected() {
         val rows = table.selectedRows.toList().mapNotNull { model.rows.getOrNull(it) }
         if (rows.isEmpty()) return
@@ -1373,17 +1744,17 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
         val row = selectedRow() ?: return
         val menu = javax.swing.JPopupMenu()
 
-        if (row is NoteItemRow) {
+        if (row is NoteItemRow && table.selectedRowCount == 1) {
             menu.add("编辑笔记").addActionListener { editNote(row) }
-            menu.add("添加标签…").addActionListener { attachTagToNote(row) }
+            menu.add("添加标签…").addActionListener { attachTagToSelection() }
             menu.add("删除该笔记").addActionListener { deleteNote(row) }
             menu.show(table, e.x, e.y)
             return
         }
 
-        if (row is StaleHeaderRow) return
+        if (table.selectedRowCount == 1 && row is StaleHeaderRow) return
 
-        if (row is StaleRow) {
+        if (row is StaleRow && table.selectedRowCount == 1) {
             menu.add("尝试重新定位（搜索相似代码）").addActionListener { tryRelocateAt(row.relativePath, row.anchor) }
             menu.add("重新绑定到当前选区").addActionListener { rebindAt(row.relativePath, row.anchor) }
             menu.add("删除该锚点").addActionListener { deleteStale(row) }
@@ -1397,44 +1768,76 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
             menu.add(item)
         }
 
-        check("显示", stateOf(row, COL_VISIBLE)) { toggleVisible(row) }
-        check("锁定", stateOf(row, COL_LOCK)) { toggleLock(row) }
-        check("简洁", stateOf(row, COL_COMPACT)) { toggleCompact(row) }
+        val rows = selectionRows()
+        val multi = rows.size > 1
+
+        check("显示", rows.all { stateOf(it, COL_VISIBLE) }) { toggleVisibleForSelection() }
+        check("锁定", rows.all { stateOf(it, COL_LOCK) }) { toggleLockForSelection() }
+        check("简洁", rows.all { stateOf(it, COL_COMPACT) }) { toggleCompactForSelection() }
+
+        if (rows.any { it is NoteRow }) {
+            menu.addSeparator()
+            menu.add(if (multi) "移除所选标题" else "移除标题").addActionListener { removeTitles() }
+        }
 
         val colorMenu = javax.swing.JMenu("颜色")
-        if (row is NoteRow && row.anchor.colorOverride != null) {
+        if (selectedNoteRows().any { it.anchor.colorOverride != null }) {
             val follow = javax.swing.JMenuItem("跟随分组颜色")
-            follow.addActionListener {
-                service.setAnchorColorOverride(row.anchor.id, null)
-                AnchorRenderService.get(project).refreshAll()
-                refresh()
-            }
+            follow.addActionListener { resetColorToGroup() }
             colorMenu.add(follow)
             colorMenu.addSeparator()
         }
         for (i in 0..7) {
             val item = javax.swing.JMenuItem("颜色 ${i + 1}", DotIcon(NotePalette.accent(i)))
-            item.addActionListener { applyColor(row, i) }
+            item.addActionListener { applyColorToSelection(i) }
             colorMenu.add(item)
         }
         menu.add(colorMenu)
 
-        if (row is GroupRow) {
+        if (rows.any { it is GroupRow || it is NoteRow }) {
+            menu.add("添加标签…").addActionListener { attachTagToSelection() }
+        }
+
+        if (multi) {
+            if (rows.any { it is NoteRow }) {
+                menu.addSeparator()
+                menu.add(buildMoveToGroupMenu())
+                menu.add("新建分组并放入所选…").addActionListener { groupSelectionIntoNewGroup() }
+            }
             menu.addSeparator()
-            menu.add("添加标签…").addActionListener { attachTagToGroup(row) }
+            menu.add("删除所选（${rows.size} 项）").addActionListener { deleteSelected() }
+            menu.add("新建分组").addActionListener { newGroup() }
+            menu.show(table, e.x, e.y)
+            return
+        }
+
+        if (row is GroupRow) {
+            if (service.defaultGroupId() == row.group.id) {
+                menu.add("取消默认分组").addActionListener {
+                    service.setDefaultGroup(null)
+                    refresh()
+                }
+            } else {
+                menu.add("设为默认分组").addActionListener {
+                    service.setDefaultGroup(row.group.id)
+                    refresh()
+                }
+            }
         }
         if (row is GroupRow && hasChildren(row.group.id)) {
             check("折叠", row.group.id in collapsed) { toggleCollapse(row.group.id) }
         }
         if (row is NoteRow) {
             menu.addSeparator()
-            if (textChanged(row.relativePath, row.anchor)) {
+            if (row.changed) {
                 menu.add("尝试重新定位（搜索相似代码）").addActionListener { tryRelocateAt(row.relativePath, row.anchor) }
                 menu.add("重新绑定到当前选区").addActionListener { rebindAt(row.relativePath, row.anchor) }
             }
             menu.add("追加笔记").addActionListener { addNoteDialog(row) }
+            menu.add("创建克隆节点").addActionListener { createCloneNode(row) }
+            menu.add(buildMoveToGroupMenu())
             menu.add("添加标签…").addActionListener { attachTagToAnchor(row) }
-            if (row.anchor.notes.size > 1) {                val label = if (row.anchor.id in expandedNotes) "收起笔记" else "展开笔记"
+            if (service.resolvedNotes(row.anchor).size > 1) {                val label = if (row.anchor.id in expandedNotes) "收起笔记" else "展开笔记"
                 menu.add(label).addActionListener { toggleNotes(row.anchor.id) }
             }
         }
