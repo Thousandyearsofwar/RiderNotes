@@ -27,6 +27,7 @@ import java.awt.Graphics2D
 import java.awt.RenderingHints
 import java.awt.event.ActionEvent
 import java.awt.event.KeyEvent
+import java.awt.KeyboardFocusManager
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.AbstractAction
@@ -149,6 +150,28 @@ private class NotesTable(model: javax.swing.table.TableModel) : JTable(model) {
 
     /** 多选状态下按住其中一行准备拖动：不要立刻把选区塌缩成一行。 */
     var suppressCollapse: Boolean = false
+
+    /**
+     * 按下瞬间的选区快照。
+     *
+     * JTable 的 UI 监听器比我们注册得早，等我们的 mousePressed 跑起来时，
+     * 选区可能已经被它塌缩成一行，所以要在 processMouseEvent 里先抓一份。
+     */
+    var pressedSelection: List<Int> = emptyList()
+
+    override fun processMouseEvent(e: java.awt.event.MouseEvent) {
+        if (e.id == java.awt.event.MouseEvent.MOUSE_PRESSED &&
+            javax.swing.SwingUtilities.isLeftMouseButton(e)
+        ) {
+            val row = rowAtPoint(e.point)
+            pressedSelection = if (row >= 0 && isRowSelected(row) && selectedRowCount > 1) {
+                selectedRows.toList()
+            } else {
+                emptyList()
+            }
+        }
+        super.processMouseEvent(e)
+    }
 
     override fun changeSelection(rowIndex: Int, columnIndex: Int, toggle: Boolean, extend: Boolean) {
         if (dragging) return
@@ -423,6 +446,14 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
                 if (pressRow < 0) return
                 if (start.distance(e.point) < 5) return
                 // 一旦开始拖动，禁止表格自己扩选；否则经过的每一行都会被"激活"
+                if (!table.dragging && table.pressedSelection.size > 1) {
+                    // 按下时 UI 已把选区塌缩成一行，这里把整批"拖动中"的行重新高亮，
+                    // 让用户看到这次拖的到底是哪几条。
+                    table.selectionModel.clearSelection()
+                    table.pressedSelection.forEach { table.addRowSelectionInterval(it, it) }
+                    table.selectionModel.anchorSelectionIndex = table.pressedSelection.first()
+                    table.selectionModel.leadSelectionIndex = table.pressedSelection.first()
+                }
                 table.dragging = true
                 val row = table.rowAtPoint(e.point)
                 if (row < 0) {
@@ -455,6 +486,7 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
                 pressRow = -1
                 val wasDragging = table.dragging
                 table.dragging = false
+
                 val moved = start != null && start.distance(e.point) >= 5
                 val collapse = table.suppressCollapse
                 table.suppressCollapse = false
@@ -512,11 +544,19 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
         table.addMouseListener(tableMouse)
         table.addMouseMotionListener(tableMouse)
         installUndoKeys()
+        installPanelKeyDispatcher()
 
-        table.inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_F2, 0), "ridenotes-rename")
-        table.actionMap.put("ridenotes-rename", object : AbstractAction() {
+        // F2：表格层 + 面板层都绑（表格没焦点时也能触发）
+        val renameAction = object : AbstractAction() {
             override fun actionPerformed(e: ActionEvent) = renameSelected()
-        })
+        }
+        val f2 = KeyStroke.getKeyStroke(KeyEvent.VK_F2, 0)
+        table.inputMap.put(f2, "ridenotes-rename")
+        table.actionMap.put("ridenotes-rename", renameAction)
+        inputMap.put(f2, "ridenotes-rename-panel")
+        actionMap.put("ridenotes-rename-panel", renameAction)
+        table.getInputMap(javax.swing.JComponent.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT).put(f2, "ridenotes-rename-ancestor")
+        table.actionMap.put("ridenotes-rename-ancestor", renameAction)
         table.inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_DELETE, 0), "ridenotes-delete")
         table.actionMap.put("ridenotes-delete", object : AbstractAction() {
             override fun actionPerformed(e: ActionEvent) = deleteSelected()
@@ -1116,9 +1156,10 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
         val target = model.rows.getOrNull(table.rowAtPoint(e.point)) ?: return
         val mode = table.dropMode
 
-        // 多选时整批拖动；单选时只动按下的那一行
-        val dragged = if (table.isRowSelected(sourceRow) && table.selectedRowCount > 1) {
-            table.selectedRows.toList().mapNotNull { model.rows.getOrNull(it) }
+        // 多选时整批拖动：优先用"按下瞬间"的选区快照（UI 可能已把当前选区塌缩）
+        val snapshot = table.pressedSelection
+        val dragged = if (snapshot.size > 1) {
+            snapshot.mapNotNull { model.rows.getOrNull(it) }
         } else {
             listOfNotNull(model.rows.getOrNull(sourceRow))
         }.filter { it is GroupRow || it is NoteRow }
@@ -1194,6 +1235,14 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
 
         AnchorRenderService.get(project).refreshAll()
         refresh()
+
+        // 拖完后保持这批行仍被选中
+        val movedIds = dragged.map { it.id }.toSet()
+        val indices = model.rows.indices.filter { model.rows[it].id in movedIds }
+        if (indices.isNotEmpty()) {
+            table.selectionModel.clearSelection()
+            indices.forEach { table.addRowSelectionInterval(it, it) }
+        }
     }
 
     /** parentId 是否在 groupId 的子树里（把组拖进自己子树会成环）。 */
@@ -1314,6 +1363,53 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
 
 
     /** 面板里也能 Ctrl+Z：显式把 editor 传给 UndoManager，不依赖焦点。 */
+    private var keyDispatcher: java.awt.KeyEventDispatcher? = null
+
+    /**
+     * 面板内的快捷键兜底：焦点在表格上时自己处理 F2 / Delete。
+     *
+     * 不同键位方案（如 Visual Studio Code）会把 F2 绑给编辑器的重命名，
+     * IDE 的键位系统可能先把它吃掉，导致面板里的输入映射收不到。
+     * 这里在 KeyEventDispatcher 层直接拦截，不依赖 Keymap。
+     */
+    private fun installPanelKeyDispatcher() {
+        val dispatcher = object : java.awt.KeyEventDispatcher {
+            override fun dispatchKeyEvent(e: java.awt.event.KeyEvent): Boolean {
+                if (e.id != java.awt.event.KeyEvent.KEY_PRESSED) return false
+                if (KeyboardFocusManager.getCurrentKeyboardFocusManager().focusOwner !== table) return false
+                if (e.modifiersEx and (java.awt.event.InputEvent.CTRL_DOWN_MASK or
+                        java.awt.event.InputEvent.ALT_DOWN_MASK or
+                        java.awt.event.InputEvent.SHIFT_DOWN_MASK) != 0
+                ) {
+                    return false
+                }
+                return when (e.keyCode) {
+                    java.awt.event.KeyEvent.VK_F2 -> {
+                        renameSelected()
+                        true
+                    }
+
+                    java.awt.event.KeyEvent.VK_DELETE -> {
+                        deleteSelected()
+                        true
+                    }
+
+                    else -> false
+                }
+            }
+        }
+        keyDispatcher = dispatcher
+        java.awt.KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(dispatcher)
+    }
+
+    /** 工具窗关闭时摘掉全局分发器，避免泄漏。 */
+    fun dispose() {
+        keyDispatcher?.let {
+            java.awt.KeyboardFocusManager.getCurrentKeyboardFocusManager().removeKeyEventDispatcher(it)
+        }
+        keyDispatcher = null
+    }
+
     private fun installUndoKeys() {
         fun bind(stroke: KeyStroke, name: String, block: () -> Unit) {
             table.inputMap.put(stroke, name)
@@ -1384,7 +1480,11 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
         refresh()
     }
 
+    /** 供 AnAction 调用：重命名当前选中项。 */
+    fun requestRename() = renameSelected()
+
     private fun renameSelected() {
+        com.thousandyearsofwar.ridenotes.util.NoteLog.info("rename requested, selectedRow=${table.selectedRow}")
         when (val row = selectedRow()) {
             is GroupRow -> {
                 val title = Messages.showInputDialog(project, "分组标题", "重命名", null, row.group.title, null) ?: return
@@ -1607,6 +1707,15 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
     /**
      * 把选中的锚点克隆到编辑器当前选区：位置是新的，内容跟随源锚点。
      */
+    /** 把锚点复制成 Markdown 链接，粘到任意笔记里就能跳回来。 */
+    private fun copyAnchorLink(row: NoteRow) {
+        val title = service.resolvedTitle(row.anchor).ifBlank { row.anchor.displayTitle }
+        val text = com.thousandyearsofwar.ridenotes.model.NoteLinks.format(title, row.anchor.id)
+        java.awt.Toolkit.getDefaultToolkit().systemClipboard
+            .setContents(java.awt.datatransfer.StringSelection(text), null)
+        com.thousandyearsofwar.ridenotes.util.NoteLog.notify(project, "已复制链接：$text")
+    }
+
     /** 右键锚点 → 在同一个分组里追加一个克隆节点（不新增代码区间，也不渲染）。 */
     private fun createCloneNode(row: NoteRow) {
         val clone = service.createCloneNode(row.anchor.id)
@@ -1835,6 +1944,7 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
             }
             menu.add("追加笔记").addActionListener { addNoteDialog(row) }
             menu.add("创建克隆节点").addActionListener { createCloneNode(row) }
+            menu.add("复制锚点链接").addActionListener { copyAnchorLink(row) }
             menu.add(buildMoveToGroupMenu())
             menu.add("添加标签…").addActionListener { attachTagToAnchor(row) }
             if (service.resolvedNotes(row.anchor).size > 1) {                val label = if (row.anchor.id in expandedNotes) "收起笔记" else "展开笔记"

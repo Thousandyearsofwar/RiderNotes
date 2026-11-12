@@ -27,34 +27,50 @@
     </extensions>
 
     <actions>
+
+
         <action id="RiderNotes.CreateAnchor"
                 class="com.thousandyearsofwar.ridenotes.actions.CreateAnchorAction"
                 text="%action.create.text"
                 description="%action.create.description">
             <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt N"/>
-            <add-to-group group-id="EditorPopupMenu" anchor="first"/>
+            <keyboard-shortcut keymap="Visual Studio Code" first-keystroke="ctrl alt N"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl shift alt N"/>
         </action>
         <action id="RiderNotes.DeleteAnchor"
                 class="com.thousandyearsofwar.ridenotes.actions.DeleteAnchorAction"
                 text="%action.delete.text"
-                description="%action.delete.description">
-            <add-to-group group-id="EditorPopupMenu" anchor="after" relative-to-action="RiderNotes.CreateAnchor"/>
+                description="%action.delete.description"/>
+        <action id="RiderNotes.Rename"
+                class="com.thousandyearsofwar.ridenotes.actions.RenameNoteAction"
+                text="%action.rename.text"
+                description="%action.rename.description">
+            <keyboard-shortcut keymap="$default" first-keystroke="F2"/>
+            <keyboard-shortcut keymap="Visual Studio Code" first-keystroke="F2"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="shift F6"/>
         </action>
         <action id="RiderNotes.Refresh"
                 class="com.thousandyearsofwar.ridenotes.actions.RefreshAnchorsAction"
                 text="%action.refresh.text"
-                description="%action.refresh.description">
-            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
-        </action>
+                description="%action.refresh.description"/>
         <action id="RiderNotes.ToggleCompact"
                 class="com.thousandyearsofwar.ridenotes.actions.ToggleCompactAction"
-                text="%action.compact.text">
-            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
-        </action>
+                text="%action.compact.text"/>
         <action id="RiderNotes.ToggleLock"
                 class="com.thousandyearsofwar.ridenotes.actions.ToggleLockAction"
-                text="%action.lock.text">
+                text="%action.lock.text"/>
+        <!-- 全部动作收敛到一个子菜单，整体挂到编辑器右键菜单最后 -->
+        <group id="RiderNotes.EditorMenu"
+               class="com.intellij.openapi.actionSystem.DefaultActionGroup"
+               text="%action.group.text"
+               popup="true">
             <add-to-group group-id="EditorPopupMenu" anchor="last"/>
-        </action>
+            <reference ref="RiderNotes.CreateAnchor"/>
+            <reference ref="RiderNotes.DeleteAnchor"/>
+            <separator/>
+            <reference ref="RiderNotes.ToggleCompact"/>
+            <reference ref="RiderNotes.ToggleLock"/>
+            <reference ref="RiderNotes.Refresh"/>
+        </group>
     </actions>
 </idea-plugin>

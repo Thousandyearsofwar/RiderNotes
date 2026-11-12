@@ -33,6 +33,7 @@ import java.awt.Graphics2D
 import java.awt.Rectangle
 import java.awt.RenderingHints
 import javax.swing.Icon
+import com.thousandyearsofwar.ridenotes.model.NoteLinks
 
 /** 可视区上下各留多少行做块渲染，超出部分只保留色带和 gutter 图标。 */
 private const val MARGIN = 200
@@ -171,6 +172,68 @@ private class SummaryBlockRenderer(
     private var cacheKey = ""
     private var cachedLines: List<String> = emptyList()
 
+    // 最近一次绘制时的几何信息，供点击命中测试用（paint 一定先于点击发生）
+    private var paintedLeft = 0
+    private var paintedTop = 0
+    private var paintedLines: List<String> = emptyList()
+    private var paintedMetrics: java.awt.FontMetrics? = null
+
+    /** 绘制时算好的链接命中矩形：点击时直接比较坐标，不再重新解析/测宽。 */
+    private data class PaintedLink(val x1: Int, val x2: Int, val y1: Int, val y2: Int, val target: String)
+
+    private var paintedLinks: List<PaintedLink> = emptyList()
+
+    /** 行文本 → 链接列表缓存，避免每帧重复跑正则。 */
+    private val linkCache = HashMap<String, List<NoteLinks.Link>>()
+
+    private fun linksOf(line: String): List<NoteLinks.Link> {
+        linkCache[line]?.let { return it }
+        if (linkCache.size > 512) linkCache.clear()
+        val parsed = NoteLinks.parse(line)
+        linkCache[line] = parsed
+        return parsed
+    }
+
+    /**
+     * 点击位置是否落在某个锚点链接上；是则返回目标锚点 id。
+     *
+     * 几何优先用 inlay.bounds（平台给的位置），paint 记录只作兜底。
+     */
+    fun linkAt(inlay: Inlay<*>, px: Int, py: Int): String? {
+        // 快路径：绘制时算好的矩形，命中判断零分配、零测宽
+        paintedLinks.forEach { link ->
+            if (px in link.x1..link.x2 && py in link.y1..link.y2) return link.target
+        }
+
+        val bounds = runCatching { inlay.bounds }.getOrNull()
+        val metrics = paintedMetrics ?: inlay.editor.contentComponent.getFontMetrics(font)
+        val left = bounds?.x ?: paintedLeft
+        val top = bounds?.y ?: paintedTop
+        val available = ((bounds?.width ?: 400) - indentPx - 24).coerceAtLeast(20)
+
+        val allLines = text.split('\n').map { it.trimEnd() }.ifEmpty { listOf("") }
+        val lineHeight = metrics.height
+        if (py < top || py > top + allLines.size * lineHeight + 8) {
+            com.thousandyearsofwar.ridenotes.util.NoteLog.info(
+                "link miss: py=$py not in $top..${top + allLines.size * lineHeight + 8} bounds=$bounds"
+            )
+            return null
+        }
+        val lineIndex = ((py - top - 2) / lineHeight).coerceIn(0, allLines.size - 1)
+        val line = ellipsize(metrics, allLines[lineIndex], available)
+        val originX = left + indentPx + 8
+        val links = linksOf(line)
+        com.thousandyearsofwar.ridenotes.util.NoteLog.info(
+            "link hit: px=$px py=$py line=$lineIndex origin=$originX text='${line.take(60)}' links=${links.map { it.targetId }}"
+        )
+        for (link in links) {
+            val startX = originX + metrics.stringWidth(line.substring(0, link.start))
+            val endX = startX + metrics.stringWidth(line.substring(link.start, link.end))
+            if (px in startX..endX) return link.targetId
+        }
+        return null
+    }
+
     /**
      * 宽度：默认跟随窗口（贴着右边缘）；设置里填了 >0 才作为上限。
      * 必须用 scrollingModel.visibleArea（视口），contentComponent.width 是内容宽度，横向滚动时会更大。
@@ -243,22 +306,62 @@ private class SummaryBlockRenderer(
             g2.fillRoundRect(left, targetRegion.y, 3, blockHeight, 2, 2)
 
             var baseline = targetRegion.y + metrics.ascent + 2
+            val visibleLines = mutableListOf<String>()
+            val newLinks = mutableListOf<PaintedLink>()
+            val metricsCache = HashMap<Font, java.awt.FontMetrics>()
+            paintedLeft = left
+            paintedTop = targetRegion.y
+            paintedMetrics = metrics
+
             lines.forEachIndexed { index, line ->
                 val stamp = stamps[index].orEmpty()
                 val textLeft = left + 8
-                if (stamp.isEmpty()) {
-                    g2.color = JBColor.foreground()
-                    g2.drawString(ellipsize(metrics, line, (width - 16).coerceAtLeast(20)), textLeft, baseline)
+                val stampedWidth = if (stamp.isEmpty()) {
+                    (width - 16).coerceAtLeast(20)
                 } else {
-                    val stampWidth = metrics.stringWidth(stamp)
-                    val textWidth = (width - 16 - stampWidth - 12).coerceAtLeast(20)
+                    (width - 16 - metrics.stringWidth(stamp) - 12).coerceAtLeast(20)
+                }
+                val visible = ellipsize(metrics, line, stampedWidth)
+                visibleLines.add(visible)
+
+                var x = textLeft
+                var cursor = 0
+                linksOf(visible).forEach { link ->
+                    if (link.start > cursor) {
+                        g2.color = JBColor.foreground()
+                        val plain = visible.substring(cursor, link.start)
+                        x = drawWithFallback(g2, plain, x, baseline, metricsCache)
+                    }
+                    g2.color = Color(0x3D, 0x7E, 0xC7)
+                    val linkText = visible.substring(link.start, link.end)
+                    val linkStartX = x
+                    x = drawWithFallback(g2, linkText, x, baseline, metricsCache)
+                    val linkWidth = x - linkStartX
+                    g2.drawLine(linkStartX, baseline + 2, x, baseline + 2)
+                    newLinks.add(
+                        PaintedLink(
+                            x1 = linkStartX,
+                            x2 = x,
+                            y1 = targetRegion.y + 2 + index * metrics.height,
+                            y2 = targetRegion.y + 2 + (index + 1) * metrics.height,
+                            target = link.targetId
+                        )
+                    )
+                    cursor = link.end
+                }
+                if (cursor < visible.length) {
                     g2.color = JBColor.foreground()
-                    g2.drawString(ellipsize(metrics, line, textWidth), textLeft, baseline)
+                    x = drawWithFallback(g2, visible.substring(cursor), x, baseline, metricsCache)
+                }
+
+                if (stamp.isNotEmpty()) {
                     g2.color = Color(0x99, 0x99, 0x99)
-                    g2.drawString(stamp, left + width - 8 - stampWidth, baseline)
+                    g2.drawString(stamp, left + width - 8 - metrics.stringWidth(stamp), baseline)
                 }
                 baseline += metrics.height
             }
+            paintedLines = visibleLines
+            paintedLinks = newLinks
 
             // 笔记之间画一条细分隔线（第一条之前不画）
             val noteStarts = stamps.keys.sorted()
@@ -291,6 +394,40 @@ private class SummaryBlockRenderer(
         return cachedLines
     }
 
+    /** 按字体回退逐段绘制，返回结束 x。等宽字体本身没有中文，直接 drawString 会变方块。 */
+    private fun drawWithFallback(
+        g: Graphics2D,
+        text: String,
+        startX: Int,
+        baseline: Int,
+        metricsCache: MutableMap<Font, java.awt.FontMetrics>
+    ): Int {
+        if (text.isEmpty()) return startX
+        var x = startX
+        FontFallback.segments(font, text).forEach { (runFont, part) ->
+            g.font = runFont
+            g.drawString(part, x, baseline)
+            val metrics = metricsCache.getOrPut(runFont) { g.getFontMetrics(runFont) }
+            x += metrics.stringWidth(part)
+        }
+        g.font = font
+        return x
+    }
+
+    /** 与 drawWithFallback 一致的宽度计算（用于截断与右对齐）。 */
+    private fun widthWithFallback(
+        g: Graphics2D,
+        text: String,
+        metricsCache: MutableMap<Font, java.awt.FontMetrics>
+    ): Int {
+        if (text.isEmpty()) return 0
+        var width = 0
+        FontFallback.segments(font, text).forEach { (runFont, part) ->
+            val metrics = metricsCache.getOrPut(runFont) { g.getFontMetrics(runFont) }
+            width += metrics.stringWidth(part)
+        }
+        return width
+    }
     /** 二分截断，别用逐字删（长文本会 O(n²) 卡绘制）。 */
     private fun ellipsize(metrics: java.awt.FontMetrics, text: String, maxWidth: Int): String {
         if (text.isEmpty() || metrics.stringWidth(text) <= maxWidth) return text
@@ -330,6 +467,7 @@ class AnchorRenderService(private val project: Project) {
         states[editor] = state
         editor.document.addDocumentListener(state.documentListener, project)
         editor.addEditorMouseListener(state.mouseListener)
+        editor.addEditorMouseMotionListener(state.motionListener)
         // 延后一帧再画：项目打开瞬间不要同步去建几千个 highlighter
         ApplicationManager.getApplication().invokeLater {
             if (!editor.isDisposed) render(state)
@@ -340,6 +478,7 @@ class AnchorRenderService(private val project: Project) {
         val state = states.remove(editor) ?: return
         editor.document.removeDocumentListener(state.documentListener)
         editor.removeEditorMouseListener(state.mouseListener)
+        runCatching { editor.removeEditorMouseMotionListener(state.motionListener) }
         state.dispose()
         state.clear()
     }
@@ -421,7 +560,8 @@ class AnchorRenderService(private val project: Project) {
             val (anchor, range) = pair
             val color = service.effectiveColor(anchor)
             val signature = contentSignature(anchor, color)
-            val withBlock = anchor.endLine >= window.first && anchor.startLine <= window.last
+            val withBlock = com.thousandyearsofwar.ridenotes.settings.NotesSettings.get().showSummary &&
+                (!state.shouldCull() || (anchor.endLine >= window.first && anchor.startLine <= window.last))
 
             val existing = existingById[id]
             val sameRange = existing != null &&
@@ -478,6 +618,7 @@ class AnchorRenderService(private val project: Project) {
         val compact = service.effectiveCompact(anchor)
         return buildString {
             append(settings.maxWidth).append(':').append(settings.fontSize).append(':').append(color)
+            append(':').append(if (settings.showSummary) 1 else 0)
             append(':').append(if (compact) 1 else 0)
             append('|').append(service.resolvedTitle(anchor))
             service.resolvedNotes(anchor).forEach { note ->
@@ -517,6 +658,34 @@ class AnchorRenderService(private val project: Project) {
             runCatching { editor.scrollingModel.removeVisibleAreaListener(scrollListener) }
             runCatching { editor.contentComponent.removeComponentListener(repaintListener) }
             runCatching { editor.component?.removeComponentListener(repaintListener) }
+            runCatching { restoreTextCursor() }
+        }
+
+        /** 鼠标停在正文链接上时用"手型"，移开恢复文本光标。 */
+        private fun updateCursorFor(mouseX: Int, mouseY: Int, inlay: Inlay<*>?) {
+            val target = inlay?.let {
+                (it.renderer as? SummaryBlockRenderer)?.linkAt(it, mouseX, mouseY)
+            }
+            if (target != null) setHandCursor() else restoreTextCursor()
+        }
+
+        private fun setHandCursor() {
+            val component = editor.contentComponent
+            val hand = java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR)
+            if (component.cursor != hand) component.cursor = hand
+        }
+
+        private fun restoreTextCursor() {
+            val component = editor.contentComponent
+            val text = java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.TEXT_CURSOR)
+            if (component.cursor != text) component.cursor = text
+        }
+
+        val motionListener = object : com.intellij.openapi.editor.event.EditorMouseMotionListener {
+            override fun mouseMoved(event: com.intellij.openapi.editor.event.EditorMouseEvent) {
+                val mouse = event.mouseEvent
+                updateCursorFor(mouse.x, mouse.y, event.inlay)
+            }
         }
 
         /**
@@ -557,6 +726,11 @@ class AnchorRenderService(private val project: Project) {
         }
 
         val mouseListener = object : EditorMouseListener {
+            /** 鼠标离开编辑器：把链接的"手型"光标恢复成文本光标。 */
+            override fun mouseExited(event: EditorMouseEvent) {
+                restoreTextCursor()
+            }
+
             override fun mousePressed(event: EditorMouseEvent) {
                 val inlay = event.inlay ?: return
                 val anchorId = inlay.getUserData(ANCHOR_ID) ?: return
@@ -569,12 +743,49 @@ class AnchorRenderService(private val project: Project) {
                     return
                 }
 
+                // 点中正文里的锚点链接：直接跳转（不进入编辑）
+                val linkTarget = (inlay.renderer as? SummaryBlockRenderer)
+                    ?.linkAt(inlay, event.mouseEvent.x, event.mouseEvent.y)
+                if (linkTarget != null) {
+                    event.consume()
+                    openAnchorLink(linkTarget)
+                    return
+                }
+
                 event.consume()
                 if (event.mouseEvent.clickCount >= 2) {
                     beginEdit(anchor, inlay, inlay.getUserData(NOTE_ID))
                 } else {
                     moveCaretTo(anchor)
                 }
+            }
+        }
+
+        /** 打开链接目标：跳到源文件对应行，并让面板定位到该锚点。 */
+        private fun openAnchorLink(anchorId: String) {
+            val found = NoteAnchorService.get(project).locateAnchor(anchorId)
+            if (found == null) {
+                com.thousandyearsofwar.ridenotes.util.NoteLog.notify(project, "链接目标已被删除")
+                return
+            }
+            val (path, target) = found
+            val base = project.basePath ?: return
+            val absolute = if (path.startsWith("/") || path.contains(":")) path else "$base/$path"
+            val vf = com.intellij.openapi.vfs.LocalFileSystem.getInstance().findFileByPath(absolute)
+            if (vf == null) {
+                com.thousandyearsofwar.ridenotes.util.NoteLog.notify(project, "链接目标文件不存在")
+                return
+            }
+            val document = com.intellij.openapi.fileEditor.FileDocumentManager.getInstance().getDocument(vf)
+            val offset = document?.let {
+                runCatching { it.getLineStartOffset((target.startLine - 1).coerceIn(0, it.lineCount - 1)) }.getOrDefault(0)
+            } ?: 0
+            runCatching {
+                com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project)
+                    .openTextEditor(com.intellij.openapi.fileEditor.OpenFileDescriptor(project, vf, offset), true)
+                project.messageBus
+                    .syncPublisher(com.thousandyearsofwar.ridenotes.ui.AnchorActivationTopic.TOPIC)
+                    .anchorActivated(anchorId)
             }
         }
 
@@ -670,8 +881,18 @@ class AnchorRenderService(private val project: Project) {
             return (top - MARGIN)..(boundedBottom + MARGIN)
         }
 
+        /** 锚点数超过这个阈值才做视口裁剪（太多块会拖慢编辑器）；小文件全保留，避免跳转错位。 */
+        private val cullThreshold = 400
+
+        fun shouldCull(): Boolean = painted.size > cullThreshold
+
         /** 滚动后只增删块，不重建 highlighter。 */
         fun updateBlockVisibility() {
+            if (!shouldCull()) {
+                // 小文件：所有锚点始终保留块，滚动/原生跳转时排版不跳动
+                painted.forEach { if (it.blocks.isEmpty()) addInlays(it) }
+                return
+            }
             val window = windowOf()
             painted.forEach { item ->
                 val first = item.anchor.startLine
@@ -708,8 +929,12 @@ class AnchorRenderService(private val project: Project) {
             val compact = service.effectiveCompact(item.anchor)
             val offset = document.getLineEndOffset(endLine)
 
-            // 摘要总开关：关掉后只有色带 + gutter 图标
-            if (!com.thousandyearsofwar.ridenotes.settings.NotesSettings.get().showSummary) return
+            // 摘要总开关：关掉后只有色带 + gutter 图标。
+            // 注意要把已有块销毁：否则编辑器仍按块高度排版，原生跳转会落到"旧位置"。
+            if (!com.thousandyearsofwar.ridenotes.settings.NotesSettings.get().showSummary) {
+                disposeInlays(item)
+                return
+            }
 
 
             // 一条笔记一个块；标题只在面板/悬停里显示，不再占用代码区

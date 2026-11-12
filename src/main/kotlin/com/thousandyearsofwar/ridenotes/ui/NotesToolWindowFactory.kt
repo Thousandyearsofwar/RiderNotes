@@ -9,8 +9,13 @@ class NotesToolWindowFactory : ToolWindowFactory {
 
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
         val panel = NotesPanel(project)
+        NotesPanelRegistry.register(project, panel)
         val content = ContentFactory.getInstance().createContent(panel, "", false)
         content.isCloseable = false
+        content.setDisposer {
+            NotesPanelRegistry.unregister(project)
+            panel.dispose()
+        }
         toolWindow.contentManager.addContent(content)
     }
 

@@ -104,7 +104,8 @@ class DeleteAnchorAction : AnAction() {
         val project = e.project
         val editor = e.getData(CommonDataKeys.EDITOR)
         val file = e.getData(CommonDataKeys.VIRTUAL_FILE)
-        e.presentation.isEnabledAndVisible =
+        e.presentation.isVisible = true
+        e.presentation.isEnabled =
             project != null && editor != null && file != null && anchorAtCaret(project, editor, file) != null
     }
 }
@@ -173,6 +174,8 @@ fun anchorAtCaret(project: Project, editor: com.intellij.openapi.editor.Editor, 
  */
 class RefreshAnchorsAction : AnAction() {
 
+
+
     override fun actionPerformed(e: AnActionEvent) {
         val project = e.project ?: return
         val file = e.getData(CommonDataKeys.VIRTUAL_FILE) ?: return
@@ -184,6 +187,8 @@ class RefreshAnchorsAction : AnAction() {
 
 /** 切换"简洁显示"：编辑器里只显示标题，内容折叠。 */
 class ToggleCompactAction : AnAction() {
+
+
 
     override fun actionPerformed(e: AnActionEvent) {
         val project = e.project ?: return
@@ -199,13 +204,16 @@ class ToggleCompactAction : AnAction() {
         val project = e.project
         val editor = e.getData(CommonDataKeys.EDITOR)
         val file = e.getData(CommonDataKeys.VIRTUAL_FILE)
-        e.presentation.isEnabledAndVisible =
+        e.presentation.isVisible = true
+        e.presentation.isEnabled =
             project != null && editor != null && file != null && anchorAtCaret(project, editor, file) != null
     }
 }
 
 /** 切换"锁定"：编辑器里不能编辑/删除，只能去面板。 */
 class ToggleLockAction : AnAction() {
+
+
 
     override fun actionPerformed(e: AnActionEvent) {
         val project = e.project ?: return
@@ -221,7 +229,8 @@ class ToggleLockAction : AnAction() {
         val project = e.project
         val editor = e.getData(CommonDataKeys.EDITOR)
         val file = e.getData(CommonDataKeys.VIRTUAL_FILE)
-        e.presentation.isEnabledAndVisible =
+        e.presentation.isVisible = true
+        e.presentation.isEnabled =
             project != null && editor != null && file != null && anchorAtCaret(project, editor, file) != null
     }
 }

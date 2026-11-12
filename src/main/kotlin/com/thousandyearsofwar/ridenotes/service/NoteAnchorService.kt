@@ -76,6 +76,7 @@ class NoteAnchorService(private val project: Project) {
         val list = mutableAnchors(relativePath)
         anchor.color = nextColor(list)
         if (anchor.groupId == null) anchor.groupId = defaultGroupId()
+        if (anchor.orderValue <= 0.0) anchor.orderValue = nextOrderValue(anchor.groupId)
         list.add(anchor)
         list.sortBy { it.startOffset }
         persist(relativePath)
@@ -89,9 +90,11 @@ class NoteAnchorService(private val project: Project) {
         val relativePath = relativePath(file) ?: return
         val list = mutableAnchors(relativePath)
         val fallbackGroup = defaultGroupId()
+        var order = nextOrderValue(fallbackGroup)
         anchors.forEach { anchor ->
             anchor.color = nextColor(list)
             if (anchor.groupId == null) anchor.groupId = fallbackGroup
+            if (anchor.orderValue <= 0.0) anchor.orderValue = order++
             list.add(anchor)
         }
         list.sortBy { it.startOffset }
@@ -622,6 +625,17 @@ class NoteAnchorService(private val project: Project) {
         }
         return moved
     }
+
+    /** 某个分组里现有子项（锚点 + 子分组）的最大顺序值 + 1，用于把新项追加到末尾。 */
+    private fun nextOrderValue(groupId: String?): Double {
+        val anchorMax = allAnchors().filter { it.groupId == groupId }.maxOfOrNull { it.orderValue } ?: Double.NEGATIVE_INFINITY
+        val groupMax = index().groups.filter { it.parentId == groupId }.maxOfOrNull { it.orderValue } ?: Double.NEGATIVE_INFINITY
+        val max = maxOf(anchorMax, groupMax)
+        return if (max == Double.NEGATIVE_INFINITY) 1.0 else max + 1.0
+    }
+
+    /** 按 id 定位锚点，返回「分片相对路径 + 锚点」，供超链接跳转用。 */
+    fun locateAnchor(anchorId: String): Pair<String, Anchor>? = findAnchor(anchorId)
 
     /** 克隆锚点的源锚点；不是克隆、或源已被删除时返回 null。 */
     fun mirrorSource(anchor: Anchor): Anchor? =
