@@ -345,8 +345,16 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
                             } else "  "
                             label.icon = AllIcons.Nodes.Folder
                             val defaultMark = if (item.group.id == service.defaultGroupId()) " <font color=\u0027#8a8a8a\u0027>默认</font>" else ""
+                            val index = service.index()
+                            val effVisible = index.effectivelyVisible(item.group.id)
+                            val effLocked = index.effectivelyLocked(item.group.id)
+                            val effCompact = index.effectivelyCompact(item.group.id)
+                            val inherited = item.group.visible != effVisible ||
+                                item.group.locked != effLocked ||
+                                item.group.compact != effCompact
+                            val inheritedMark = if (inherited) " <font color=\u0027#8a8a8a\u0027>（继承）</font>" else ""
                                 label.text = "<html><b>${escape(arrow + item.group.title.ifBlank { "未命名分组" })}</b>$defaultMark" +
-                                flagsOf(item.group.visible, item.group.locked, item.group.compact) +
+                                flagsOf(effVisible, effLocked, effCompact) + inheritedMark +
                                 tagChipsOf(item.group.tags) + "</html>"
                         }
 
@@ -1107,9 +1115,10 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private fun stateOf(row: Row, column: Int): Boolean = when (row) {
         is GroupRow -> when (column) {
-            COL_VISIBLE -> row.group.visible
-            COL_LOCK -> row.group.locked
-            COL_COMPACT -> row.group.compact
+            // 组的勾选状态要显示**生效值**：父组隐藏时，子组也应显示为未勾选（和里面的锚点一致）
+            COL_VISIBLE -> service.index().effectivelyVisible(row.group.id)
+            COL_LOCK -> service.index().effectivelyLocked(row.group.id)
+            COL_COMPACT -> service.index().effectivelyCompact(row.group.id)
             else -> false
         }
 
@@ -1285,11 +1294,28 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
     private fun toggleVisibleForSelection() {
         val rows = selectionRows().filter { it is GroupRow || it is NoteRow }
         if (rows.isEmpty()) return
+        // 用"生效值"判断方向：父组隐藏时子组也视为隐藏
         val turnOff = rows.all {
             when (it) {
-                is GroupRow -> it.group.visible
+                is GroupRow -> service.index().effectivelyVisible(it.group.id)
                 is NoteRow -> service.effectiveVisible(it.anchor)
                 else -> true
+            }
+        }
+        if (!turnOff) {
+            // 想把它们打开：如果有祖先分组是隐藏的，开了也看不见，直接提示
+            val blocked = rows.any {
+                when (it) {
+                    is GroupRow -> hasHiddenAncestor(it.group.id)
+                    is NoteRow -> hasHiddenAncestor(it.anchor.groupId)
+                    else -> false
+                }
+            }
+            if (blocked) {
+                com.thousandyearsofwar.ridenotes.util.NoteLog.notify(
+                    project, "父分组已隐藏，先显示父分组"
+                )
+                return
             }
         }
         val groups = selectedGroupRows().map { it.group.id }
@@ -1300,14 +1326,49 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
     }
 
+    /** 祖先链里是否有分组自身被锁定（不含自己）。 */
+    private fun hasLockedAncestor(groupId: String?): Boolean {
+        var cursor = groupId?.let { service.index().group(it) }?.parentId?.let { service.index().group(it) }
+        var guard = 0
+        while (cursor != null && guard++ < 64) {
+            if (cursor.locked) return true
+            cursor = cursor.parentId?.let { service.index().group(it) }
+        }
+        return false
+    }
+
+    /** 祖先链里是否有分组自身被隐藏（不含自己）。 */
+    private fun hasHiddenAncestor(groupId: String?): Boolean {
+        var cursor = groupId?.let { service.index().group(it) }?.parentId?.let { service.index().group(it) }
+        var guard = 0
+        while (cursor != null && guard++ < 64) {
+            if (!cursor.visible) return true
+            cursor = cursor.parentId?.let { service.index().group(it) }
+        }
+        return false
+    }
+
     private fun toggleLockForSelection() {
         val rows = selectionRows().filter { it is GroupRow || it is NoteRow }
         if (rows.isEmpty()) return
         val turnOn = rows.any {
             when (it) {
-                is GroupRow -> !it.group.locked
+                is GroupRow -> !service.index().effectivelyLocked(it.group.id)
                 is NoteRow -> !service.effectiveLocked(it.anchor)
                 else -> false
+            }
+        }
+        if (!turnOn) {
+            val blocked = rows.any {
+                when (it) {
+                    is GroupRow -> hasLockedAncestor(it.group.id)
+                    is NoteRow -> hasLockedAncestor(it.anchor.groupId)
+                    else -> false
+                }
+            }
+            if (blocked) {
+                com.thousandyearsofwar.ridenotes.util.NoteLog.notify(project, "父分组已锁定，先解锁父分组")
+                return
             }
         }
         val groups = selectedGroupRows().map { it.group.id }
@@ -1323,7 +1384,7 @@ class NotesPanel(private val project: Project) : JPanel(BorderLayout()) {
         if (rows.isEmpty()) return
         val turnOn = rows.any {
             when (it) {
-                is GroupRow -> !it.group.compact
+                is GroupRow -> !service.index().effectivelyCompact(it.group.id)
                 is NoteRow -> !service.effectiveCompact(it.anchor)
                 else -> false
             }
