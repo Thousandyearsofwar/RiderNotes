@@ -1,5 +1,8 @@
 # Sidecar Notes（侧挂笔记）
 
+![编辑器与面板](docs/screenshots/editor-and-panel.png)
+
+
 > 仓库目录名仍为 `RiderNotes`；插件在 IDE 与 Marketplace 上显示为 **Sidecar Notes**
 > （JetBrains 自 2024-03 起禁止插件名包含 "Rider"，`verifyPlugin` 会直接判为无效）。
 
