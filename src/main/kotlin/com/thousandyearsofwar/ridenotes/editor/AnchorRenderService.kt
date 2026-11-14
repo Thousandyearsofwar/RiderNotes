@@ -160,7 +160,7 @@ private class LineEndRenderer(private val colorIndex: Int) : EditorCustomElement
 private class SummaryBlockRenderer(
     private val anchor: Anchor,
     private val text: String,
-    private val indentPx: Int,
+    private val indentColumns: Int,
     private val compact: Boolean,
     private val color: Int,
     private val stamps: Map<Int, String>
@@ -209,7 +209,8 @@ private class SummaryBlockRenderer(
         val metrics = paintedMetrics ?: inlay.editor.contentComponent.getFontMetrics(font)
         val left = bounds?.x ?: paintedLeft
         val top = bounds?.y ?: paintedTop
-        val available = ((bounds?.width ?: 400) - indentPx - 24).coerceAtLeast(20)
+        val indent = indent(inlay)
+        val available = ((bounds?.width ?: 400) - indent - 24).coerceAtLeast(20)
 
         val allLines = text.split('\n').map { it.trimEnd() }.ifEmpty { listOf("") }
         val lineHeight = metrics.height
@@ -221,7 +222,7 @@ private class SummaryBlockRenderer(
         }
         val lineIndex = ((py - top - 2) / lineHeight).coerceIn(0, allLines.size - 1)
         val line = ellipsize(metrics, allLines[lineIndex], available)
-        val originX = left + indentPx + 8
+        val originX = left + indent + 8
         val links = linksOf(line)
         com.thousandyearsofwar.ridenotes.util.NoteLog.info(
             "link hit: px=$px py=$py line=$lineIndex origin=$originX text='${line.take(60)}' links=${links.map { it.targetId }}"
@@ -381,7 +382,21 @@ private class SummaryBlockRenderer(
     private fun metrics(inlay: Inlay<*>): java.awt.FontMetrics =
         inlay.editor.contentComponent.getFontMetrics(font)
 
-    private fun indent(inlay: Inlay<*>): Int = indentPx.coerceAtLeast(0)
+    /**
+     * 缩进像素：按**当前**编辑器字体把列数换算成像素。
+     *
+     * 不能只在创建时算一次——编辑器字号缩放（Ctrl+滚轮）后空格宽度会变，
+     * 缓存的像素值就会和代码缩进对不上。
+     */
+    private fun indent(inlay: Inlay<*>): Int {
+        if (indentColumns <= 0) return 0
+        val editorMetrics = runCatching {
+            inlay.editor.contentComponent.getFontMetrics(
+                inlay.editor.colorsScheme.getFont(com.intellij.openapi.editor.colors.EditorFontType.PLAIN)
+            )
+        }.getOrNull() ?: return 0
+        return indentColumns * editorMetrics.charWidth(' ').coerceAtLeast(1)
+    }
 
     /** 行数不设上限：简洁模式已经在外层把每条压成一行了。 */
     private fun renderLines(metrics: java.awt.FontMetrics): List<String> {
@@ -908,17 +923,10 @@ class AnchorRenderService(private val project: Project) {
             if (!editor.isDisposed) editor.contentComponent.repaint()
         }
 
-        /** 前导空白对应的像素宽度：按编辑器字体的空格宽度和 tab 宽度换算，与视口无关。 */
-        private fun indentPixels(document: com.intellij.openapi.editor.Document, lineStart: Int, firstNonWs: Int): Int {
+        /** 前导空白的**列数**（tab 按制表位展开）。像素宽度在绘制时按当前字体算，缩放后仍能对齐。 */
+        private fun indentColumns(document: com.intellij.openapi.editor.Document, lineStart: Int, firstNonWs: Int): Int {
             if (firstNonWs <= lineStart) return 0
-            val metrics = runCatching {
-                editor.contentComponent.getFontMetrics(
-                    editor.colorsScheme.getFont(com.intellij.openapi.editor.colors.EditorFontType.PLAIN)
-                )
-            }.getOrNull() ?: return 0
-            val spaceWidth = metrics.charWidth(' ').coerceAtLeast(1)
             val tabSize = runCatching { editor.settings.getTabSize(project) }.getOrDefault(4).coerceAtLeast(1)
-
             var columns = 0
             for (i in lineStart until firstNonWs) {
                 when (document.charsSequence[i]) {
@@ -926,7 +934,7 @@ class AnchorRenderService(private val project: Project) {
                     else -> columns += 1
                 }
             }
-            return columns * spaceWidth
+            return columns
         }
 
         fun addInlays(item: Painted, signature: String = item.contentSignature) {
@@ -944,7 +952,7 @@ class AnchorRenderService(private val project: Project) {
             val lineEnd = document.getLineEndOffset(startLine)
             var firstNonWs = lineStart
             while (firstNonWs < lineEnd && document.charsSequence[firstNonWs].isWhitespace()) firstNonWs++
-            val indentPx = indentPixels(document, lineStart, firstNonWs)
+            val indentColumns = indentColumns(document, lineStart, firstNonWs)
 
             val endLine = document.getLineNumber(end)
             val service = NoteAnchorService.get(project)
@@ -985,7 +993,7 @@ class AnchorRenderService(private val project: Project) {
 
                 val inlay = editor.inlayModel.addBlockElement(
                     offset, true, false, 50,
-                    SummaryBlockRenderer(item.anchor, text, indentPx, compact, item.color, stamps)
+                    SummaryBlockRenderer(item.anchor, text, indentColumns, compact, item.color, stamps)
                 )
                 if (inlay != null) {
                     inlay.putUserData(ANCHOR_ID, item.anchor.id)
