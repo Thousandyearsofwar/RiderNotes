@@ -57,8 +57,7 @@ class TagLibraryDialog(private val project: Project) : DialogWrapper(project) {
     private val treeModel = DefaultTreeModel(root)
     private val tree = TagTree(treeModel)
 
-    private val ungroupedNode = DefaultMutableTreeNode(Ungrouped)
-    private object Ungrouped
+        private object Ungrouped
 
     init {
         title = com.thousandyearsofwar.ridenotes.RiderNotesBundle.message("tags.title")
@@ -75,7 +74,9 @@ class TagLibraryDialog(private val project: Project) : DialogWrapper(project) {
                 when (val payload = node.userObject) {
                     is TagGroupNode -> text = "<html><b>${payload.name}</b></html>"
                     is TagDef -> text = "<html>#${payload.name}</html>"
-                    Ungrouped -> text = "<html><i>未分组</i></html>"
+                    Ungrouped -> text = "<html><i>" +
+                        com.thousandyearsofwar.ridenotes.RiderNotesBundle.message("tags.defaultGroup") +
+                        "</i></html>"
                     else -> text = ""
                 }
                 return label
@@ -168,8 +169,9 @@ class TagLibraryDialog(private val project: Project) : DialogWrapper(project) {
         panel.add(JBScrollPane(tree), BorderLayout.CENTER)
 
         val bar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        bar.add(JButton(com.thousandyearsofwar.ridenotes.RiderNotesBundle.message("panel.newGroup")).apply { addActionListener { newGroup() } })
+        // 新建标签放最前面（最常用）
         bar.add(JButton(com.thousandyearsofwar.ridenotes.RiderNotesBundle.message("tags.newTag")).apply { addActionListener { newTag() } })
+        bar.add(JButton(com.thousandyearsofwar.ridenotes.RiderNotesBundle.message("panel.newGroup")).apply { addActionListener { newGroup() } })
         bar.add(JButton(com.thousandyearsofwar.ridenotes.RiderNotesBundle.message("panel.rename")).apply { addActionListener { renameSelected() } })
         bar.add(JButton(com.thousandyearsofwar.ridenotes.RiderNotesBundle.message("panel.delete")).apply { addActionListener { deleteSelected() } })
         panel.add(bar, BorderLayout.SOUTH)
@@ -187,7 +189,7 @@ class TagLibraryDialog(private val project: Project) : DialogWrapper(project) {
         val byGroup = service.tags().groupBy { it.groupId }
 
         byGroup[null]?.takeIf { it.isNotEmpty() }?.let { tags ->
-            val node = DefaultMutableTreeNode(ungroupedNode, true)
+            val node = DefaultMutableTreeNode(Ungrouped, true)
             tags.sortedBy { it.name }.forEach { node.add(DefaultMutableTreeNode(it, false)) }
             root.add(node)
         }
