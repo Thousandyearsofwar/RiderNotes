@@ -908,6 +908,27 @@ class AnchorRenderService(private val project: Project) {
             if (!editor.isDisposed) editor.contentComponent.repaint()
         }
 
+        /** 前导空白对应的像素宽度：按编辑器字体的空格宽度和 tab 宽度换算，与视口无关。 */
+        private fun indentPixels(document: com.intellij.openapi.editor.Document, lineStart: Int, firstNonWs: Int): Int {
+            if (firstNonWs <= lineStart) return 0
+            val metrics = runCatching {
+                editor.contentComponent.getFontMetrics(
+                    editor.colorsScheme.getFont(com.intellij.openapi.editor.colors.EditorFontType.PLAIN)
+                )
+            }.getOrNull() ?: return 0
+            val spaceWidth = metrics.charWidth(' ').coerceAtLeast(1)
+            val tabSize = runCatching { editor.settings.getTabSize(project) }.getOrDefault(4).coerceAtLeast(1)
+
+            var columns = 0
+            for (i in lineStart until firstNonWs) {
+                when (document.charsSequence[i]) {
+                    '\t' -> columns += tabSize - (columns % tabSize)
+                    else -> columns += 1
+                }
+            }
+            return columns * spaceWidth
+        }
+
         fun addInlays(item: Painted, signature: String = item.contentSignature) {
             val document = editor.document
             val start = item.highlighter.startOffset.coerceIn(0, document.textLength)
@@ -916,13 +937,14 @@ class AnchorRenderService(private val project: Project) {
             val startLine = document.getLineNumber(start)
 
             // 摘要行要和代码缩进对齐：取锚定首行第一个非空白字符的像素位置
+            // 缩进要按"文本列数"算，不能用视觉坐标：
+            // visualPositionToXY 对**视口外**的位置（跳转前没显示过的区域）返回值不可靠，
+            // 会把块横向甩出很远。这里只依赖文档内容和字体宽度，与滚动/视口无关。
             val lineStart = document.getLineStartOffset(startLine)
             val lineEnd = document.getLineEndOffset(startLine)
             var firstNonWs = lineStart
             while (firstNonWs < lineEnd && document.charsSequence[firstNonWs].isWhitespace()) firstNonWs++
-            val indentPx = runCatching {
-                editor.visualPositionToXY(editor.offsetToVisualPosition(firstNonWs)).x
-            }.getOrDefault(0).coerceAtLeast(0)
+            val indentPx = indentPixels(document, lineStart, firstNonWs)
 
             val endLine = document.getLineNumber(end)
             val service = NoteAnchorService.get(project)
