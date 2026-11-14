@@ -115,9 +115,7 @@ class NotesHttpServer(private val project: Project) {
         runCatching {
             val dir = com.thousandyearsofwar.ridenotes.model.AnchorStore.baseDir(project) ?: return@runCatching
             java.nio.file.Files.createDirectories(dir)
-            val version = com.intellij.ide.plugins.PluginManagerCore.getPlugin(
-                com.intellij.openapi.extensions.PluginId.getId("com.thousandyearsofwar.ridenotes")
-            )?.version ?: ""
+            val version = com.thousandyearsofwar.ridenotes.util.PluginInfo.version
             val payload = gson.toJson(
                 mapOf("port" to port, "token" to token, "version" to version, "project" to project.name)
             )
@@ -170,15 +168,13 @@ class NotesHttpServer(private val project: Project) {
 
             path == "/status" -> {
                 val status = onEdt {
-                    val plugin = com.intellij.ide.plugins.PluginManagerCore.getPlugin(
-                        com.intellij.openapi.extensions.PluginId.getId("com.thousandyearsofwar.ridenotes")
-                    )
+
                     mapOf(
                         "ok" to true,
                         "project" to project.name,
                         "basePath" to (project.basePath ?: ""),
                         "libraryPath" to NotesProjectSettings.getInstance(project).libraryPath,
-                        "version" to (plugin?.version ?: ""),
+                        "version" to com.thousandyearsofwar.ridenotes.util.PluginInfo.version,
                         "port" to actualPort,
                         "anchors" to com.thousandyearsofwar.ridenotes.model.AnchorStore.listAll(project)
                             .sumOf { it.anchors.size },

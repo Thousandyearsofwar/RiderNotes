@@ -13,15 +13,33 @@ version = pluginVersion
 
 repositories {
     mavenCentral()
-    intellijPlatform {
+    tasks.processResources {
+    filesMatching("ridenotes-version.properties") {
+        expand("version" to pluginVersion)
+    }
+}
+
+intellijPlatform {
         defaultRepositories()
     }
 }
 
 dependencies {
-    intellijPlatform {
+    tasks.processResources {
+    filesMatching("ridenotes-version.properties") {
+        expand("version" to pluginVersion)
+    }
+}
+
+intellijPlatform {
         // 本地安装的 Rider：2026.2 的产物在公开仓库里通常拿不到，直接指本机最稳
         local(riderHome)
+    }
+}
+
+tasks.processResources {
+    filesMatching("ridenotes-version.properties") {
+        expand("version" to pluginVersion)
     }
 }
 
